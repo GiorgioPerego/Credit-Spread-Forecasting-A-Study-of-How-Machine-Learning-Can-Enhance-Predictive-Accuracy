@@ -1,0 +1,2955 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import logging
+import warnings
+import time
+from sklearn.preprocessing import StandardScaler
+from factor_analyzer import FactorAnalyzer
+from pandas_datareader import data as web
+import yfinance as yf
+from statsmodels.tsa.stattools import adfuller
+from hmmlearn.hmm import GaussianHMM
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from scipy.optimize import minimize
+from scipy import stats
+from sklearn.base import BaseEstimator, RegressorMixin
+
+
+
+from skopt import BayesSearchCV
+from skopt.space import Real, Integer
+from sklearn.model_selection import TimeSeriesSplit, train_test_split, RandomizedSearchCV
+import xgboost as xgb
+
+
+import torch
+import torch.nn as nn
+from torch.utils.data import IterableDataset, DataLoader
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import contextlib
+
+torch.backends.cudnn.benchmark = True
+
+
+warnings.filterwarnings('ignore')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+warnings.filterwarnings("ignore", category=UserWarning, module='sklearn')
+
+# ===== Forecast settings =====
+FORECAST_H = 1
+FORECAST_MODE = 'level'
+
+##########################################################
+#                COMMON CONFIGURATION                    #
+##########################################################
+class CommonConfig:
+    """
+    Configuration class defining start/end dates, FRED and Yahoo series, and file paths for data loading.
+    """
+    START_DATE = '2000-01-01'
+    END_DATE = '2025-03-26'
+    FRED_SERIES = {
+        'Credit_Spread': ('BAMLC0A4CBBBEY', 'DGS10'),
+        'TB3MS': 'TB3MS',
+        'TERMCBAUTO48NS': 'TERMCBAUTO48NS',
+        'PCE': 'PCE',
+        'CPIAUCSL': 'CPIAUCSL',
+        'GDP': 'GDP',
+        'y_lag1': 'BAMLC0A4CBBBEY'
+    }
+    YAHOO_SERIES = {
+        'SPY_DIFF': 'Spy.xlsx'
+    }
+    PATHS = {
+        'TED_RATE': 'tedspread2.xlsx',
+        'POLICY': 'Categorical_EPU_Data2.csv'
+    }
+
+
+##########################################################
+#                COMMON DATA LOADER                      #
+##########################################################
+class CommonDataLoader:
+    """
+    Class responsible for loading and fetching data from FRED, Yahoo Finance, TED Rate Excel, and policy CSV files.
+    """
+
+    def __init__(self, config):
+        self.config = config
+
+    def fetch_fred_data(self):
+        """
+        Retrieves FRED data for specified series in the configuration.
+        Computes the difference between two series if the value is a tuple.
+        """
+        fred_results = {}
+        max_retries = 3
+        for key, value in self.config.FRED_SERIES.items():
+            for attempt in range(max_retries):
+                try:
+                    if isinstance(value, tuple):
+                        data1 = web.DataReader(value[0], 'fred', self.config.START_DATE, self.config.END_DATE)
+                        data2 = web.DataReader(value[1], 'fred', self.config.START_DATE, self.config.END_DATE)
+                        fred_results[key] = data1[value[0]] - data2[value[1]]
+                        logging.info(f"{key} downloaded successfully. Last date: {fred_results[key].index[-1]}")
+                        break
+                    else:
+                        df = web.DataReader(value, 'fred', self.config.START_DATE, self.config.END_DATE)
+                        fred_results[key] = df[value]
+                        logging.info(f"{key} downloaded successfully. Last date: {fred_results[key].index[-1]}")
+                        break
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        logging.error(f"Error downloading {key} after {max_retries} attempts: {e}")
+                    else:
+                        time.sleep(2 ** attempt)
+        return pd.DataFrame(fred_results)
+
+    def load_tedrate(self):
+        """
+        Loads TED rate data from an Excel file, parsing dates and yields.
+        """
+        try:
+            ted_df = pd.read_excel(
+                self.config.PATHS['TED_RATE'],
+                header=None,
+                names=["Date", "Yield"],
+                decimal=","
+            )
+            ted_df['Date'] = pd.to_datetime(ted_df['Date'], dayfirst=True, errors='coerce')
+            ted_df = ted_df.dropna(subset=['Date']).set_index('Date').sort_index()
+            ted_df = ted_df.loc[self.config.START_DATE:self.config.END_DATE]
+            logging.info(f"TEDRATE loaded. Last date: {ted_df.index[-1]}")
+            return ted_df['Yield'].rename('TEDRATE')
+        except Exception as e:
+            logging.error(f"Error loading TED rate: {e}")
+            return pd.Series(dtype=float, name='TEDRATE')
+
+    def fetch_yahoo_data(self):
+        yahoo_results = {}
+        for key, path_or_ticker in self.config.YAHOO_SERIES.items():
+            try:
+                if key == 'SPY_DIFF':
+                    spy_df = pd.read_excel(
+                        path_or_ticker,
+                        header=None,
+                        names=["Date", "Close"],
+                        decimal=","
+                    )
+                    spy_df['Date'] = pd.to_datetime(spy_df['Date'], dayfirst=True, errors='coerce')
+                    spy_df = spy_df.dropna(subset=['Date']).set_index('Date').sort_index()
+                    spy_df = spy_df.loc[self.config.START_DATE:self.config.END_DATE]
+
+                    spy_df['EMA12'] = spy_df['Close'].ewm(span=12, adjust=False).mean()
+                    spy_df['EMA26'] = spy_df['Close'].ewm(span=26, adjust=False).mean()
+                    yahoo_results[key] = spy_df['EMA12'] - spy_df['EMA26']
+                else:
+                    df = yf.download(path_or_ticker, start=self.config.START_DATE, end=self.config.END_DATE,
+                                     progress=False, auto_adjust=True)
+                    if not df.empty:
+                        yahoo_results[key] = df['Close']
+                logging.info(f"{key} successfully loaded. Last date: {yahoo_results[key].index[-1]}")
+            except Exception as e:
+                logging.error(f"Error loading {key}: {e}")
+                yahoo_results[key] = pd.Series(dtype=float)
+        return pd.DataFrame(yahoo_results)
+
+    def load_policy_data(self):
+        """
+        Loads policy data from a CSV file, converting Year and Month to a datetime index.
+        """
+        try:
+            df = pd.read_csv(self.config.PATHS['POLICY'], sep=';', encoding='utf-8-sig',
+                             decimal=',', on_bad_lines='skip', engine='python')
+            df['Year'] = pd.to_numeric(df['Year'], errors='coerce').astype('Int64')
+            df['Month'] = pd.to_numeric(df['Month'], errors='coerce').astype('Int64')
+            df = df.dropna(subset=['Year', 'Month'])
+            df['Date'] = pd.to_datetime(df['Year'].astype(str) + '-' +
+                                        df['Month'].astype(str).str.zfill(2) + '-01',
+                                        errors='coerce')
+            df = df.dropna(subset=['Date']).drop(columns=['Year', 'Month']).set_index('Date')
+            logging.info(f"Policy data loaded. Last date: {df.index[-1]}, Columns: {df.columns.tolist()}")
+            return df
+        except Exception as e:
+            logging.error(f"Error loading policy data: {e}")
+            return pd.DataFrame()
+
+
+# ====================== FAST TCN (streaming) ======================
+class StreamingWindowDataset(IterableDataset):
+    """Windows generated on the fly: memory usage and time per epoch ~ constant."""
+    def __init__(self, df, feature_cols, target_col, regime_col=None,
+                 window=512, horizon=1, samples_per_epoch=80000):
+        super().__init__()
+        self.X = df[feature_cols].values.astype(np.float32)
+        self.y = df[target_col].values.astype(np.float32)
+        self.reg = df[regime_col].values.astype(np.int64) if (regime_col and regime_col in df.columns) else None
+        self.window, self.horizon = window, horizon
+        self.T = len(df)
+        self.samples = int(samples_per_epoch)
+        self.max_start = max(0, self.T - (window + horizon) + 1)
+        nan_feat = np.isnan(self.X).any(1)
+        nan_tgt  = np.isnan(self.y)
+        self.nan_row = nan_feat | nan_tgt
+        self.nan_cumsum = np.concatenate([[0], np.cumsum(self.nan_row)])
+
+        starts = np.arange(self.max_start)
+        bad = (self.nan_cumsum[starts + self.window] - self.nan_cumsum[starts]) > 0
+        j = starts + self.window + self.horizon - 1
+        mask_y = ~np.isnan(self.y[j])
+        self.valid_starts = starts[~bad & mask_y]
+
+    def _window_ok(self, i):
+        j = i + self.window + self.horizon - 1
+        has_nan = (self.nan_cumsum[i+self.window] - self.nan_cumsum[i]) > 0
+        return (not has_nan) and (not np.isnan(self.y[j]))
+
+    def __iter__(self):
+        rng = np.random.default_rng()
+        emitted = 0
+        if len(self.valid_starts) == 0:
+            return
+        while emitted < self.samples:
+            i = int(rng.choice(self.valid_starts))
+            Xw = self.X[i:i + self.window].T
+            yv = self.y[i + self.window + self.horizon - 1]
+            if self.reg is not None:
+                r = int(self.reg[i + self.window - 1])
+                yield torch.from_numpy(Xw), torch.tensor([yv], dtype=torch.float32), torch.tensor(r, dtype=torch.long)
+            else:
+                yield torch.from_numpy(Xw), torch.tensor([yv], dtype=torch.float32)
+            emitted += 1
+
+
+class TCNBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, k=3, dilation=1, dropout=0.0):
+        super().__init__()
+        self.pad = (k - 1) * dilation
+        self.conv = nn.Conv1d(in_ch, out_ch, k, dilation=dilation, padding=self.pad)
+        self.act  = nn.ReLU()
+        self.drop = nn.Dropout(dropout)
+        self.res  = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+
+    def forward(self, x):
+        y = self.conv(x)
+        if self.pad > 0:
+            y = y[..., :-self.pad]    # crop casual
+        y = self.act(y)
+        y = self.drop(y)
+        res = x if isinstance(self.res, nn.Identity) else self.res(x)
+        res = res[..., -y.size(-1):]
+        return self.act(y + res)
+
+
+class TCNForecaster(nn.Module):
+    def __init__(self, in_channels, channels=16, n_blocks=9, k=3, dropout=0.0, n_regimes=None):
+        super().__init__()
+        self.in_proj = nn.Conv1d(in_channels, channels, 1)
+        dil = [2**i for i in range(n_blocks)]
+        self.blocks = nn.ModuleList([TCNBlock(channels, channels, k, d, dropout) for d in dil])
+        self.n_regimes = n_regimes
+        if n_regimes:
+            self.emb = nn.Embedding(n_regimes, 4)
+            self.head = nn.Linear(channels + 4, 1)
+        else:
+            self.emb = None
+            self.head = nn.Linear(channels, 1)
+
+    def forward(self, x, reg=None):
+        h = self.in_proj(x)
+        for b in self.blocks:
+            h = b(h)
+        h_last = h[..., -1]
+        if self.emb is not None and reg is not None:
+            h_last = torch.cat([h_last, self.emb(reg)], dim=-1)
+        return self.head(h_last).squeeze(-1)
+
+
+# ==================== TCN CORE + WRAPPER (drop-in) ====================
+
+class TCNRegressorFastCore:
+    """
+    Fast TCN core (streaming).
+    - Trains on windows generated on-the-fly.
+    - 'residual_mode':
+        * 'level' -> learns the target level
+        * 'diff'  -> learns the delta: y[t] - y[t-1]
+      In both cases the target is z-score normalized during fit and
+      brought back to the original scale at predict time.
+    - Validation on contiguous tail windows with ReduceLROnPlateau.
+    """
+    def __init__(
+        self,
+        window=512,
+        horizon=1,
+        channels=32,
+        n_blocks=7,
+        kernel_size=3,
+        dropout=0.0,
+        n_regimes=None,
+        batch_size=256,
+        samples_per_epoch=12000,
+        max_epochs=10,
+        patience=4,
+        lr=3e-3,
+        weight_decay=1e-4,
+        num_workers=0,
+        device=None,
+        cap_cpu_budget=True,    # if False, do not tighten the budget on CPU/MPS
+        residual_mode='level'   # 'level' (default) or 'diff'
+    ):
+        self.window = int(window)
+        self.horizon = int(horizon)
+        self.channels = int(channels)
+        self.n_blocks = int(n_blocks)
+        self.kernel_size = int(kernel_size)
+        self.dropout = float(dropout)
+        self.n_regimes = int(n_regimes) if n_regimes else None
+        self.batch_size = int(batch_size)
+        self.samples_per_epoch = int(samples_per_epoch)
+        self.max_epochs = int(max_epochs)
+        self.patience = int(patience)
+        self.lr = float(lr)
+        self.weight_decay = float(weight_decay)
+        self.num_workers = int(num_workers)
+        self.cap_cpu_budget = bool(cap_cpu_budget)
+
+        # residual mode
+        if residual_mode not in ('level', 'diff'):
+            raise ValueError("residual_mode must be 'level' or 'diff'")
+        self.residual_mode = residual_mode
+        self.y_mode = residual_mode  # internal alias
+
+        # Device
+        if device is not None:
+            self.device = torch.device(device)
+        else:
+            if torch.cuda.is_available():
+                self.device = torch.device("cuda")
+            elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                self.device = torch.device("mps")
+            else:
+                self.device = torch.device("cpu")
+
+        # Reduce load on CPU/MPS only if requested
+        if self.device.type != "cuda" and self.cap_cpu_budget:
+            self.samples_per_epoch = min(self.samples_per_epoch, 8000)
+            self.max_epochs = min(self.max_epochs, 6)
+            self.batch_size = min(self.batch_size, 128)
+            self.num_workers = 0  # on CPU/MPS it's often better to use 0
+        self.model = None
+        self.feature_cols = None
+        self.target_col = None
+        self.regime_col = None
+        self.y_mean = 0.0
+        self.y_std = 1.0
+
+
+    # ----- helper: validation loader con finestre contigue in coda -----
+    def _val_loader(self, df, feature_cols, target_col, regime_col):
+        X = df[feature_cols].values.astype(np.float32)
+        y = df[target_col].values.astype(np.float32)
+        reg = df[regime_col].values.astype(np.int64) if (regime_col and regime_col in df.columns) else None
+
+        N = len(df)
+        nwin = min(1024, max(0, N - (self.window + self.horizon) + 1))
+        if nwin == 0:
+            return None
+
+        starts = np.arange(N - (self.window + self.horizon) + 1 - nwin, N - (self.window + self.horizon) + 1)
+        Xw = np.stack([X[i:i+self.window].T for i in starts])
+        yv = np.array([y[i + self.window + self.horizon - 1] for i in starts], dtype=np.float32)
+
+        if reg is not None:
+            rv = np.array([reg[i + self.window - 1] for i in starts], dtype=np.int64)
+            ds = torch.utils.data.TensorDataset(torch.from_numpy(Xw), torch.from_numpy(yv), torch.from_numpy(rv))
+        else:
+            ds = torch.utils.data.TensorDataset(torch.from_numpy(Xw), torch.from_numpy(yv))
+
+        return DataLoader(ds, batch_size=self.batch_size, shuffle=False)
+
+    def fit(self, X_df, y_series, feature_cols, target_col, regime_col=None):
+        # prepare df (ordering and minimal dropna)
+        df = X_df.copy()
+        df[target_col] = y_series
+        df = df.sort_index()
+
+        # save metadata
+        self.feature_cols = list(feature_cols)
+        self.target_col = target_col
+        self.regime_col = regime_col if (regime_col in df.columns) else None
+
+        # --- target engineering + standardization ---
+        # If residual_mode == 'diff' we train on the delta: y[t] - y[t-1]
+        if self.y_mode == 'diff':
+            y_tilde = df[target_col] - df[target_col].shift(1)
+            df = df.dropna(subset=self.feature_cols + [target_col]).copy()
+            df['__y_tilde__'] = y_tilde
+            # remove NaNs introduced by differencing
+            df = df.dropna(subset=['__y_tilde__'])
+
+            self.y_mean = float(df['__y_tilde__'].mean())
+            self.y_std = float(df['__y_tilde__'].std() + 1e-8)
+            df['__tgt__'] = (df['__y_tilde__'] - self.y_mean) / self.y_std
+            tgt_name = '__tgt__'
+        else:
+            # 'level'
+            df = df.dropna(subset=self.feature_cols + [target_col]).copy()
+            self.y_mean = float(df[target_col].mean())
+            self.y_std = float(df[target_col].std() + 1e-8)
+            df['__tgt__'] = (df[target_col] - self.y_mean) / self.y_std
+            tgt_name = '__tgt__'
+
+        # model
+        in_ch = len(self.feature_cols)
+        self.model = TCNForecaster(
+            in_channels=in_ch,
+            channels=self.channels,
+            n_blocks=self.n_blocks,
+            k=self.kernel_size,
+            dropout=self.dropout,
+            n_regimes=(self.n_regimes if self.regime_col is not None else None)
+        ).to(self.device)
+
+        # compile (meglio su CUDA Linux)
+        import platform
+        if hasattr(torch, "compile") and (self.device.type == "cuda") and platform.system() == "Linux":
+            try:
+                self.model = torch.compile(self.model, mode="reduce-overhead", backend="inductor")
+            except Exception:
+                pass
+
+        opt = AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        sched = ReduceLROnPlateau(opt, mode="min", patience=3, factor=0.5)
+        crit = nn.HuberLoss(delta=1.0)
+
+        amp_enabled = (self.device.type == "cuda")
+        scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+
+        def amp_ctx():
+            return torch.cuda.amp.autocast() if amp_enabled else contextlib.nullcontext()
+
+        # train loader (streaming)
+        train_stream = StreamingWindowDataset(
+            df,
+            self.feature_cols,
+            tgt_name,
+            self.regime_col,
+            window=self.window,
+            horizon=self.horizon,
+            samples_per_epoch=self.samples_per_epoch
+        )
+        pin = (self.device.type == "cuda")
+        loader_kwargs = dict(
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=pin
+        )
+        if self.num_workers > 0:
+            loader_kwargs.update(dict(prefetch_factor=4, persistent_workers=True))
+        train_loader = DataLoader(train_stream, **loader_kwargs)
+
+        # validation loader dalla coda del train
+        val_loader = self._val_loader(df.tail(200000), self.feature_cols, tgt_name, self.regime_col)
+
+        # training loop
+        best_val = float("inf")
+        bad = 0
+        for epoch in range(self.max_epochs):
+            self.model.train()
+            run = 0.0
+            nstep = 0
+            for batch in train_loader:
+                opt.zero_grad(set_to_none=True)
+                if self.regime_col is not None and len(batch) == 3:
+                    xb, yb, rb = batch
+                    xb = xb.to(self.device, non_blocking=True)
+                    yb = yb.to(self.device)
+                    rb = rb.to(self.device)
+                    with amp_ctx():
+                        pred = self.model(xb, rb)
+                        loss = crit(pred, yb.squeeze())
+                else:
+                    xb, yb = batch
+                    xb = xb.to(self.device, non_blocking=True)
+                    yb = yb.to(self.device)
+                    with amp_ctx():
+                        pred = self.model(xb)
+                        loss = crit(pred, yb.squeeze())
+
+                scaler.scale(loss).backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                scaler.step(opt)
+                scaler.update()
+                run += loss.item()
+                nstep += 1
+
+            # validation
+            if val_loader is not None:
+                self.model.eval()
+                v = 0.0
+                vN = 0
+                with torch.no_grad(), amp_ctx():
+                    for vb in val_loader:
+                        if self.regime_col is not None and len(vb) == 3:
+                            vx, vy, vr = [t.to(self.device) for t in vb]
+                            pv = self.model(vx, vr)
+                            lv = crit(pv, vy.squeeze())
+                        else:
+                            vx, vy = [t.to(self.device) for t in vb]
+                            pv = self.model(vx)
+                            lv = crit(pv, vy.squeeze())
+                        v += lv.item()
+                        vN += 1
+                v = v / max(1, vN)
+
+                old_lr = opt.param_groups[0]["lr"]
+                sched.step(v)
+                new_lr = opt.param_groups[0]["lr"]
+                if new_lr != old_lr:
+                    logging.info(f"LR reduced from {old_lr:.2e} to {new_lr:.2e} (val={v:.6f})")
+
+                if v < best_val:
+                    best_val = v
+                    bad = 0
+                else:
+                    bad += 1
+                if bad >= self.patience:
+                    break
+
+        return self
+
+    def predict(self, X_df):
+        df = X_df.copy()
+        # check feature columns
+        for c in self.feature_cols:
+            if c not in df.columns:
+                raise ValueError(f"Missing column: {c}")
+
+        X = df[self.feature_cols].values.astype(np.float32)
+        reg = df[self.regime_col].values.astype(np.int64) if (
+                self.regime_col and self.regime_col in df.columns) else None
+
+        N = len(df)
+        nwin = max(0, N - (self.window + self.horizon) + 1)
+        if nwin == 0:
+            return np.array([], dtype=np.float32)
+
+        starts = np.arange(nwin)
+        Xw = np.stack([X[i:i + self.window].T for i in starts]).astype(np.float32)
+
+        amp_enabled = (self.device.type == "cuda")
+
+        def amp_ctx():
+            return torch.cuda.amp.autocast() if amp_enabled else contextlib.nullcontext()
+
+        self.model.eval()
+        with torch.no_grad(), amp_ctx():
+            xb = torch.from_numpy(Xw).to(self.device)
+            if reg is not None:
+                rv = np.array([reg[i + self.window - 1] for i in starts], dtype=np.int64)
+                # --------- REGIME SANITIZATION ----------
+                rv = pd.Series(rv).replace(-1, np.nan).ffill().bfill().fillna(0).astype(np.int64).values
+                if getattr(self, "n_regimes", None):
+                    rv = np.clip(rv, 0, self.n_regimes - 1)
+                # ----------------------------------------
+                rb = torch.from_numpy(rv).to(self.device)  # LongTensor for the Embedding
+                yp = self.model(xb, rb).detach().cpu().numpy()
+            else:
+                yp = self.model(xb).detach().cpu().numpy()
+
+        # de-standardize back to the training target scale
+        y_mean = getattr(self, "y_mean", 0.0)
+        y_std = getattr(self, "y_std", 1.0)
+        y_pred = yp * y_std + y_mean
+
+        # Note: if residual_mode == 'diff', y_pred are DELTAS (not levels).
+        # Level reconstruction must be done downstream (evaluator) using:
+        #   level_pred[t] = prev_level[t] + delta_pred[t]
+        return y_pred
+
+
+class TCNRegressorFastSK:
+    """
+    Scikit-learn–style wrapper for TCNRegressorFastCore.
+    - Cleans the regime column ('Regime' or 'market_regime_cs') in both fit and predict:
+      replaces -1 with NaN, then ffill/bfill -> int.
+    - If the target name starts with 'Target*', it shifts it back by 1 in fit to avoid double shifting.
+      In predict, it drops the first point to re-align.
+    - Exposes .is_tcn so ModelEvaluator can use the offset (window + horizon - 1).
+    """
+    def __init__(self, residual_mode='level', **kwargs):
+        self.core = TCNRegressorFastCore(residual_mode=residual_mode, **kwargs)
+        self.is_tcn = True
+        self._uses_target_adjustment = False
+        self.residual_mode = residual_mode  # exposed to the evaluator
+
+    @property
+    def window(self):  return self.core.window
+    @property
+    def horizon(self): return self.core.horizon
+
+    def _clean_regime(self, X):
+        Xc = X.copy()
+        regime_col = next((c for c in ("Regime", "market_regime_cs") if c in Xc.columns), None)
+        if regime_col is not None:
+            Xc[regime_col] = (
+                Xc[regime_col]
+                .replace(-1, np.nan)
+                .ffill()
+                .bfill()
+                .astype(int)
+            )
+        return Xc, regime_col
+
+    def fit(self, X, y):
+        import pandas as pd
+        Xc, regime_col = self._clean_regime(X)
+
+        y_adj = y.copy()
+        self._uses_target_adjustment = False
+        if isinstance(y_adj, pd.Series) and y_adj.name and y_adj.name.lower().startswith("target"):
+            y_adj = y_adj.shift(1)  # Target[t] (= CS[t+1]) -> CS[t]
+            self._uses_target_adjustment = True
+        if not getattr(y_adj, "name", None):
+            y_adj = y_adj.rename("__target__")
+
+        feature_cols = [c for c in Xc.columns if c != regime_col]
+        self.core.fit(
+            Xc, y_adj,
+            feature_cols=feature_cols,
+            target_col=y_adj.name,
+            regime_col=regime_col
+        )
+        return self
+
+    def predict(self, X):
+        # regime cleaning ALSO in predict
+        Xc, _ = self._clean_regime(X)
+        yp = self.core.predict(Xc)
+        if self._uses_target_adjustment and isinstance(yp, np.ndarray) and len(yp) > 1:
+            yp = yp[1:]
+        return yp
+
+    def score(self, X, y):
+        from sklearn.metrics import r2_score
+        yp = self.predict(X)
+        off = self.window + self.horizon - 1
+        y_al = y.iloc[off:off+len(yp)]
+        return r2_score(y_al.values, yp)
+
+
+# ==================== /TCN CORE + WRAPPER ====================
+
+##########################################################
+#                MIDAS TRANSFORMER                       #
+##########################################################
+class MIDASTransformer:
+    """
+    Implementation of MIDAS (Mixed Data Sampling) to transform time series
+    from low frequency (monthly, quarterly) to high frequency (daily).
+
+    This class implements a "Reverse MIDAS" version that allows transforming
+    low frequency data into high frequency data, maintaining temporal coherence
+    and statistical properties of the original series.
+    """
+
+    def __init__(self, weight_function='almon', num_params=3, aggregator='sum', smooth_lambda=0.0, smooth_order=1,
+                 proxy_alpha=0.0):
+        """
+        Initialize the MIDAS transformer.
+
+        Parameters:
+        -----------
+        weight_function : str, default='almon'
+            Weight function to use ('almon' or 'beta')
+        num_params : int, default=3
+            Number of parameters for the weight function
+        aggregator : str, default='sum'
+            Aggregation method for re-aggregating daily data back to low frequency.
+            One of {'sum', 'mean', 'last'}.
+        smooth_lambda : float, default=0.0
+            Smoothness regularization strength on the intra-period weight profile.
+        smooth_order : int, default=1
+            Difference order for smoothness penalty (1 for first diff, 2 for second diff).
+        proxy_alpha : float, default=0.0
+            Weight of the proxy shape-matching penalty (0 = disabled).
+        """
+        self.weight_function = weight_function
+        self.num_params = num_params
+        self.params = None
+        self.high_freq_dates = None
+        self.low_freq_dates = None
+        self.fitted = False
+        self.proxy_series = None
+        # Aggregation and smoothness
+        valid_aggs = {'sum', 'mean', 'last'}
+        if aggregator not in valid_aggs:
+            raise ValueError(f"Invalid aggregator '{aggregator}'. Must be one of {valid_aggs}.")
+        self.aggregator = aggregator
+        self.smooth_lambda = float(smooth_lambda) if smooth_lambda is not None else 0.0
+        self.proxy_alpha = float(proxy_alpha) if proxy_alpha is not None else 0.0
+        if smooth_order not in (1, 2):
+            raise ValueError("smooth_order must be 1 or 2")
+        self.smooth_order = smooth_order
+
+    def _almon_weights(self, params, num_days):
+        """
+        Calculate weights using the Almon polynomial function.
+
+        Parameters:
+        -----------
+        params : array-like
+            Parameters of the Almon function
+        num_days : int
+            Number of days to calculate weights for
+
+        Returns:
+        --------
+        array-like
+            Normalized weights
+        """
+        i = np.arange(num_days)
+        weights = np.zeros(num_days)
+
+        # Limit parameters to avoid overflow
+        bounded_params = np.clip(params, -5, 5)
+
+        for j in range(len(bounded_params)):
+            weights += bounded_params[j] * (i ** j)
+
+        # Limit values before exponential to prevent overflow
+        weights = np.clip(weights, -20, 20)
+
+        # Apply exponential function to ensure positive weights
+        weights = np.exp(weights)
+
+        # Normalize weights to sum to 1
+        return weights / np.sum(weights)
+
+    def _beta_weights(self, params, num_days):
+        """
+        Calculate weights using the Beta function.
+
+        Parameters:
+        -----------
+        params : array-like
+            Parameters of the Beta function (a, b)
+        num_days : int
+            Number of days to calculate weights for
+
+        Returns:
+        --------
+        array-like
+            Normalized weights
+        """
+        # Ensure parameters are positive and large enough to avoid numerical problems
+        a = max(0.1, params[0])
+        b = max(0.1, params[1])
+
+        i = np.arange(1, num_days + 1) / num_days
+        weights = stats.beta.pdf(i, a, b)
+
+        # Normalize weights to sum to 1
+        return weights / np.sum(weights)
+
+    def _calculate_weights(self, params, num_days):
+        """
+        Calculate weights based on the selected weight function.
+
+        Parameters:
+        -----------
+        params : array-like
+            Parameters of the weight function
+        num_days : int
+            Number of days to calculate weights for
+
+        Returns:
+        --------
+        array-like
+            Normalized weights
+        """
+        if self.weight_function == 'almon':
+            return self._almon_weights(params, num_days)
+        elif self.weight_function == 'beta':
+            return self._beta_weights(params, num_days)
+        else:
+            raise ValueError(f"Weight function '{self.weight_function}' not supported")
+
+    def _objective_function(self, params, low_freq_data, high_freq_dates, low_freq_dates, proxy_series=None):
+        """
+        Objective function to minimize to find optimal parameters.
+
+        Parameters:
+        -----------
+        params : array-like
+            Parameters of the weight function
+        low_freq_data : array-like
+            Low frequency data
+        high_freq_dates : array-like
+            High frequency dates
+        low_freq_dates : array-like
+            Low frequency dates
+        proxy_series : pandas.Series, optional
+            High frequency proxy series used for shape-matching
+
+        Returns:
+        --------
+        float
+            Value of the objective function (mean squared error + penalties)
+        """
+        # Transform low frequency data to high frequency data
+        high_freq_data = self._transform_with_params(params, low_freq_data, high_freq_dates, low_freq_dates)
+
+        # Re-aggregate high frequency data to low frequency
+        aggregated_data = self._reaggregate_data(high_freq_data, high_freq_dates, low_freq_dates)
+
+        # Calculate mean squared error on chosen aggregator
+        mse = np.mean((low_freq_data - aggregated_data) ** 2)
+
+        # Smoothness penalty across all periods on the implied daily weight profiles
+        if self.aggregator == 'last':
+            # Degenerate profile is fixed; no smoothness penalty needed
+            smooth_penalty_total = 0.0
+        else:
+            smooth_penalty_total = 0.0
+            for i in range(len(low_freq_dates) - 1):
+                start_idx = np.where(high_freq_dates >= low_freq_dates[i])[0][0]
+                end_idx = np.where(high_freq_dates < low_freq_dates[i + 1])[0][-1] + 1
+                num_days = end_idx - start_idx
+                if num_days <= 1:
+                    continue
+                w = self._calculate_weights(params, num_days)
+                if self.smooth_order == 1:
+                    dw = np.diff(w)
+                    smooth_penalty_total += np.sum(dw * dw)
+                else:
+                    d2w = np.diff(w, n=2)
+                    smooth_penalty_total += np.sum(d2w * d2w)
+
+        # Proxy shape-matching penalty
+        proxy_penalty = 0.0
+        if self.proxy_alpha > 0 and proxy_series is not None and self.aggregator != 'last':
+            for i in range(len(low_freq_dates) - 1):
+                start_idx = np.where(high_freq_dates >= low_freq_dates[i])[0][0]
+                end_idx = np.where(high_freq_dates < low_freq_dates[i + 1])[0][-1] + 1
+                num_days = end_idx - start_idx
+
+                if num_days <= 1:
+                    continue
+
+                # Get proxy values for this period
+                proxy_segment = proxy_series.iloc[start_idx:end_idx].values
+
+                # Skip if proxy has NaN values
+                if np.isnan(proxy_segment).any():
+                    continue
+
+                # Normalize proxy segment using softmax for numerical stability
+                proxy_segment = proxy_segment - np.mean(proxy_segment)
+                proxy_segment = np.exp(proxy_segment) / np.sum(np.exp(proxy_segment))
+
+                # Calculate weights for this period
+                w = self._calculate_weights(params, num_days)
+
+                # Calculate shape mismatch penalty
+                shape_diff = proxy_segment - w
+                proxy_penalty += np.sum(shape_diff * shape_diff)
+
+        return mse + self.smooth_lambda * smooth_penalty_total + self.proxy_alpha * proxy_penalty
+
+    def _transform_with_params(self, params, low_freq_data, high_freq_dates, low_freq_dates):
+        """
+        Transform low frequency data to high frequency data using specified parameters.
+
+        Parameters:
+        -----------
+        params : array-like
+            Parameters of the weight function
+        low_freq_data : array-like
+            Low frequency data
+        high_freq_dates : array-like
+            High frequency dates
+        low_freq_dates : array-like
+            Low frequency dates
+
+        Returns:
+        --------
+        array-like
+            Transformed high frequency data
+        """
+        high_freq_data = np.zeros(len(high_freq_dates))
+
+        # For each low frequency period
+        for i in range(len(low_freq_dates) - 1):
+            # Find start and end indices of the high frequency period
+            start_idx = np.where(high_freq_dates >= low_freq_dates[i])[0][0]
+            end_idx = np.where(high_freq_dates < low_freq_dates[i + 1])[0][-1] + 1
+
+            # Calculate number of days in the period
+            num_days = end_idx - start_idx
+
+            # Calculate weights for the period
+            weights = self._calculate_weights(params, num_days)
+
+            # Distribute the low frequency value over days using weights
+            if self.aggregator == 'sum':
+                # Sum over days equals low frequency value
+                profile = low_freq_data[i] * weights
+            elif self.aggregator == 'mean':
+                # Mean over days equals low frequency value ⇒ sum equals low * num_days
+                profile = low_freq_data[i] * num_days * weights
+            elif self.aggregator == 'last':
+                # Degenerate profile: only last day equals low frequency value
+                profile = np.zeros(num_days)
+                profile[-1] = low_freq_data[i]
+            else:
+                profile = low_freq_data[i] * weights
+
+            high_freq_data[start_idx:end_idx] = profile
+
+        return high_freq_data
+
+    def _reaggregate_data(self, high_freq_data, high_freq_dates, low_freq_dates):
+        """
+        Re-aggregate high frequency data to low frequency data.
+
+        Parameters:
+        -----------
+        high_freq_data : array-like
+            High frequency data
+        high_freq_dates : array-like
+            High frequency dates
+        low_freq_dates : array-like
+            Low frequency dates
+
+        Returns:
+        --------
+        array-like
+            Re-aggregated low frequency data
+        """
+        aggregated_data = np.zeros(len(low_freq_dates) - 1)
+
+        # For each low frequency period
+        for i in range(len(low_freq_dates) - 1):
+            # Find start and end indices of the high frequency period
+            start_idx = np.where(high_freq_dates >= low_freq_dates[i])[0][0]
+            end_idx = np.where(high_freq_dates < low_freq_dates[i + 1])[0][-1] + 1
+
+            # Aggregate high frequency data for the period based on selected aggregator
+            period_slice = high_freq_data[start_idx:end_idx]
+            if self.aggregator == 'sum':
+                aggregated_data[i] = np.sum(period_slice)
+            elif self.aggregator == 'mean':
+                aggregated_data[i] = np.mean(period_slice)
+            elif self.aggregator == 'last':
+                aggregated_data[i] = period_slice[-1] if len(period_slice) > 0 else np.nan
+            else:
+                aggregated_data[i] = np.sum(period_slice)
+
+        return aggregated_data
+
+    def fit(self, low_freq_data, high_freq_dates, low_freq_dates, proxy_series=None):
+        """
+        Optimize the weight function parameters for MIDAS transformation.
+
+        Parameters:
+        -----------
+        low_freq_data : array-like
+            Low frequency data
+        high_freq_dates : array-like
+            High frequency dates (complete time index)
+        low_freq_dates : array-like
+            Low frequency dates (time index of low frequency data)
+        proxy_series : pandas.Series, optional
+            High frequency proxy series used for shape-matching
+
+        Returns:
+        --------
+        self
+            Instance of the object for method chaining
+        """
+        self.high_freq_dates = high_freq_dates
+        self.low_freq_dates = low_freq_dates
+        self.low_freq_data = low_freq_data  # Save low frequency data as attribute
+        self.proxy_series = proxy_series  # Save proxy series as attribute
+
+        # Initialize parameters
+        if self.weight_function == 'almon':
+            initial_params = np.ones(self.num_params)
+        elif self.weight_function == 'beta':
+            initial_params = np.array([2.0, 5.0])  # Initial values for a and b
+
+        # Optimize parameters with appropriate constraints
+        if self.weight_function == 'beta':
+            # For Beta function, both parameters must be > 0.1 for stability
+            bounds = [(0.1, None), (0.1, None)]
+        elif self.weight_function == 'almon':
+            # For Almon, we limit parameters to avoid overflow in the exponential
+            bounds = [(-5, 5)] * self.num_params
+
+        result = minimize(
+            self._objective_function,
+            initial_params,
+            args=(low_freq_data, high_freq_dates, low_freq_dates, proxy_series),
+            method='L-BFGS-B',
+            bounds=bounds
+        )
+
+        self.params = result.x
+        self.fitted = True
+
+        return self
+
+    def transform(self, low_freq_data=None, high_freq_dates=None, low_freq_dates=None):
+        """
+        Transform low frequency data to high frequency data.
+
+        Parameters:
+        -----------
+        low_freq_data : array-like, optional
+            Low frequency data. If None, uses training data.
+        high_freq_dates : array-like, optional
+            High frequency dates. If None, uses training dates.
+        low_freq_dates : array-like, optional
+            Low frequency dates. If None, uses training dates.
+
+        Returns:
+        --------
+        array-like
+            Transformed high frequency data
+        """
+        if not self.fitted:
+            raise ValueError("The model must be trained before transforming data")
+
+        # Use training data if no new data is provided
+        if low_freq_data is None:
+            low_freq_data = self.low_freq_data
+        if high_freq_dates is None:
+            high_freq_dates = self.high_freq_dates
+        if low_freq_dates is None:
+            low_freq_dates = self.low_freq_dates
+
+        # Transform the data
+        high_freq_data = self._transform_with_params(
+            self.params, low_freq_data, high_freq_dates, low_freq_dates
+        )
+
+        return high_freq_data
+
+    def plot_weights(self, num_days=30):
+        """
+        Visualize the calculated weights.
+
+        Parameters:
+        -----------
+        num_days : int, default=30
+            Number of days to visualize weights for
+        """
+        if not self.fitted:
+            raise ValueError("The model must be trained before visualizing weights")
+
+        weights = self._calculate_weights(self.params, num_days)
+
+        plt.figure(figsize=(10, 6))
+        plt.bar(range(num_days), weights)
+        plt.title(f'MIDAS Weights ({self.weight_function})')
+        plt.xlabel('Day')
+        plt.ylabel('Weight')
+        plt.grid(True, alpha=0.3)
+        plt.show()
+
+
+def identify_frequency(df):
+    """
+    Identifies the frequency of columns in the DataFrame.
+
+    Parameters:
+    -----------
+    df : pandas.DataFrame
+        DataFrame with the data
+
+    Returns:
+    --------
+    tuple
+        (high_freq_cols, low_freq_cols) - Lists of high and low frequency columns
+    """
+    # Calculate the percentage of non-NaN values for each column
+    non_nan_pct = df.count() / len(df)
+
+    # High frequency columns: more than 70% of non-NaN values
+    high_freq_cols = non_nan_pct[non_nan_pct > 0.7].index.tolist()
+
+    # Low frequency columns: between 5% and 70% of non-NaN values
+    low_freq_cols = non_nan_pct[(non_nan_pct > 0.05) & (non_nan_pct <= 0.7)].index.tolist()
+
+    # Remove columns with '_midas' suffix from low frequency columns
+    low_freq_cols = [col for col in low_freq_cols if not col.endswith('_midas')]
+
+    return high_freq_cols, low_freq_cols
+
+
+def transform_low_to_high_frequency(df, low_freq_cols, date_col=None, weight_function='almon', train_end_date=None,
+                                    aggregator='sum', smooth_lambda=0.0, smooth_order=1, proxies=None, proxy_alpha=0.0):
+    """
+    Transforms low frequency columns into high frequency columns using MIDAS.
+    If train_end_date is provided, the MIDAS weights are fitted ONLY on the
+    training period up to train_end_date to avoid data leakage, and then
+    applied to the full series to create features.
+
+    Parameters:
+    -----------
+    df : pandas.DataFrame
+        DataFrame containing both high and low frequency columns
+    low_freq_cols : list
+        List of names of low frequency columns to transform
+    date_col : str, optional
+        Name of the column containing dates. If None, uses the DataFrame index.
+    weight_function : str, default='almon'
+        Weight function to use ('almon' or 'beta')
+    train_end_date : str or datetime, optional
+        If provided, MIDAS weights are fitted only on data up to this date
+        to avoid data leakage. If None, fits on full dataset (may cause leakage).
+    aggregator : str or dict, default='sum'
+        Aggregation mode for re-aggregation. If a dict is provided, it should map
+        column name -> aggregator in {'sum','mean','last'}. If a string, the same
+        aggregator is used for all columns.
+    proxies : dict, optional
+        Dictionary mapping low frequency column names to high frequency proxy column names
+        Example: {'PCE': 'SPY_DIFF', 'GDP': 'VIX'}
+    proxy_alpha : float, default=0.0
+        Weight of the proxy shape-matching penalty (0 = disabled)
+
+    Returns:
+    --------
+    pandas.DataFrame
+        DataFrame with transformed columns added (suffix '_midas')
+    """
+    # Copy of the original DataFrame
+    result_df = df.copy()
+
+    # Get the dates
+    if date_col is None:
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise ValueError("The DataFrame index must be a DatetimeIndex if date_col is not specified")
+        dates = df.index
+    else:
+        dates = pd.to_datetime(df[date_col])
+
+    # For each low frequency column
+    for col in low_freq_cols:
+        if col not in df.columns:
+            logging.warning(f"Column {col} not found in DataFrame. Skipping...")
+            continue
+
+        # Full-series low frequency arrays (used for transformation)
+        low_freq_mask_full = ~df[col].isna()
+        if low_freq_mask_full.sum() < 2:
+            logging.warning(f"Column {col} has less than 2 non-NaN values. Skipping...")
+            continue
+
+        low_freq_data_full = df.loc[low_freq_mask_full, col].values
+        low_freq_dates_full = dates[low_freq_mask_full]
+
+        # Add a final boundary date for the last period (full series)
+        if len(low_freq_dates_full) > 0:
+            last_date_full = dates.max()
+            if last_date_full > low_freq_dates_full[-1]:
+                low_freq_dates_full = pd.DatetimeIndex(list(low_freq_dates_full) + [last_date_full])
+            else:
+                last_date_full = low_freq_dates_full[-1] + pd.DateOffset(months=1)
+                low_freq_dates_full = pd.DatetimeIndex(list(low_freq_dates_full) + [last_date_full])
+
+        # Define training subset to avoid leakage
+        if train_end_date is not None:
+            # Ensure train_end_date is in Timestamp format
+            train_end_ts = pd.to_datetime(train_end_date)
+            high_freq_dates_fit = dates[dates <= train_end_ts]
+            train_mask = (dates <= train_end_ts) & low_freq_mask_full
+            if train_mask.sum() < 2:
+                logging.warning(
+                    f"Column {col} has less than 2 training non-NaN values before {train_end_ts.date()}. Skipping...")
+                continue
+            low_freq_data_fit = df.loc[train_mask, col].values
+            low_freq_dates_fit = dates[train_mask]
+
+            # Add final boundary date for the training period
+            if len(low_freq_dates_fit) > 0:
+                last_date_fit = high_freq_dates_fit.max()
+                if last_date_fit > low_freq_dates_fit[-1]:
+                    low_freq_dates_fit = pd.DatetimeIndex(list(low_freq_dates_fit) + [last_date_fit])
+                else:
+                    last_date_fit = low_freq_dates_fit[-1] + pd.DateOffset(months=1)
+                    low_freq_dates_fit = pd.DatetimeIndex(list(low_freq_dates_fit) + [last_date_fit])
+        else:
+            # Fit on full period (may introduce leakage if used before split)
+            high_freq_dates_fit = dates
+            low_freq_data_fit = low_freq_data_full
+            low_freq_dates_fit = low_freq_dates_full
+
+        # Resolve aggregator per column
+        if isinstance(aggregator, dict):
+            agg_for_col = aggregator.get(col, 'sum')
+        else:
+            agg_for_col = aggregator
+
+        # Get the proxy series if specified
+        proxy_series = None
+        if proxies is not None and col in proxies and proxies[col] in df.columns:
+            proxy_series = df[proxies[col]]
+
+        # Create and train the MIDAS transformer (fit only on training period)
+        transformer = MIDASTransformer(weight_function=weight_function, aggregator=agg_for_col,
+                                       smooth_lambda=smooth_lambda, smooth_order=smooth_order,
+                                       proxy_alpha=proxy_alpha)
+        try:
+            transformer.fit(low_freq_data_fit, high_freq_dates_fit, low_freq_dates_fit, proxy_series)
+
+            # Transform using the learned weights across the full series
+            high_freq_data_full = transformer.transform(
+                low_freq_data=low_freq_data_full,
+                high_freq_dates=dates,
+                low_freq_dates=low_freq_dates_full
+            )
+
+            # Add the transformed column to the resulting DataFrame
+            result_df[f"{col}_midas"] = high_freq_data_full
+            logging.info(
+                f"MIDAS transformation successfully applied to column {col}"
+                + (f" (causal fit up to {pd.to_datetime(train_end_date).date()})" if train_end_date is not None else "")
+            )
+        except Exception as e:
+            logging.error(f"Error during MIDAS transformation of column {col}: {e}")
+
+    return result_df
+
+
+class MIDASDataLoader(CommonDataLoader):
+    """
+    Extends CommonDataLoader to automatically apply MIDAS transformation
+    to low frequency time series.
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+        # Specific low frequency columns that require MIDAS transformation
+        self.low_freq_cols = ['TERMCBAUTO48NS', 'PCE', 'CPIAUCSL', 'GDP']
+
+    def load_and_transform_data(self, train_split_ratio=0.8):
+        """
+        Loads all data and applies MIDAS transformation to low frequency columns.
+        Uses causal fit to avoid data leakage.
+
+        Parameters:
+        -----------
+        train_split_ratio : float, default=0.8
+            Ratio of data to use for training (chronological split)
+
+        Returns:
+        --------
+        pandas.DataFrame
+            Combined DataFrame with transformed columns
+        """
+        # Load all data
+        fred_df = self.fetch_fred_data()
+        ted_series = self.load_tedrate()
+        yahoo_df = self.fetch_yahoo_data()
+        policy_df = self.load_policy_data()
+
+        # Combine the data
+        fred_df['TEDRATE'] = ted_series
+        combined_df = pd.concat([fred_df, yahoo_df, policy_df], axis=1)
+        combined_df = combined_df.loc[self.config.START_DATE:]
+
+        # Automatically identify high and low frequency columns
+        high_freq_cols, auto_low_freq_cols = identify_frequency(combined_df)
+
+        # Use specified low frequency columns if present, otherwise use automatically detected ones
+        low_freq_cols_to_transform = [col for col in self.low_freq_cols if col in combined_df.columns]
+        if not low_freq_cols_to_transform:
+            low_freq_cols_to_transform = auto_low_freq_cols
+
+        logging.info(f"High frequency columns: {high_freq_cols}")
+        logging.info(f"Low frequency columns to transform: {low_freq_cols_to_transform}")
+
+        # Determine train_end_date for causal fit to avoid leakage (use chronological 80%)
+        if len(combined_df) >= 10:
+            train_size = int(len(combined_df) * train_split_ratio)
+            train_end_date = combined_df.index[train_size - 1]
+        else:
+            train_end_date = combined_df.index[-1]
+
+        # Column-specific aggregator mapping based on economic semantics
+        aggregator_map = {
+            'CPIAUCSL': 'last',  # monthly index (EOM)
+            'PCE': 'sum',  # monthly flow
+            'TERMCBAUTO48NS': 'mean',  # monthly rate
+            'GDP': 'mean'  # quarterly SAAR level
+        }
+        # Filter mapping to available columns only
+        aggregator_map = {k: v for k, v in aggregator_map.items() if k in low_freq_cols_to_transform}
+
+        # Apply MIDAS transformation with causal fit and per-column aggregators
+        transformed_df = transform_low_to_high_frequency(
+            combined_df,
+            low_freq_cols_to_transform,
+            train_end_date=train_end_date,
+            aggregator=aggregator_map if aggregator_map else 'sum',
+            smooth_lambda=1e-3,
+            smooth_order=2,
+            proxies=None,  # Default: no proxy shape-matching
+            proxy_alpha=0.0  # Default: no proxy shape-matching penalty
+        )
+
+        return transformed_df
+
+
+##########################################################
+#                      PIPELINE 1                        #
+##########################################################
+def feature_engineering_causale(df, h=1, mode='level'):
+    df = df.copy()
+    df['Credit_Spread_lag1']  = df['Credit_Spread'].shift(1)
+    df['Credit_Spread_diff1'] = df['Credit_Spread'] - df['Credit_Spread_lag1']
+    df['Credit_Spread_MA5']   = df['Credit_Spread'].rolling(window=5, min_periods=1).mean()
+    if mode == 'level':
+        df['Target'] = df['Credit_Spread'].shift(-h)
+    else:  # 'delta'
+        df['Target'] = df['Credit_Spread'].shift(-h) - df['Credit_Spread']
+    return df.dropna(subset=['Target'])
+
+
+def reduce_skew(df, cols, threshold=0.75):
+    """
+    Applies log1p transformation to reduce skewness in specified columns if it exceeds the threshold.
+    """
+    from scipy.stats import skew
+    df_trans = df.copy()
+    for col in cols:
+        s = skew(df_trans[col].dropna())
+        if abs(s) > threshold:
+            df_trans[col] = np.log1p(df_trans[col])
+            logging.info(f"Log transformation applied to {col} (skew: {s:.2f}).")
+    return df_trans
+
+
+def preprocess_data(train_df, test_df, feature_cols):
+    """
+    Preprocesses train and test DataFrames by filling missing values and scaling features.
+    """
+    train_df = train_df.fillna(method='ffill')
+    test_df = test_df.fillna(method='ffill')
+    scaler = StandardScaler()
+    train_df[feature_cols] = scaler.fit_transform(train_df[feature_cols])
+    test_df[feature_cols] = scaler.transform(test_df[feature_cols])
+    logging.info(f"Train set preprocessed - Rows: {len(train_df)}, Last date: {train_df.index[-1]}")
+    logging.info(f"Test set preprocessed - Rows: {len(test_df)}, Last date: {test_df.index[-1]}")
+    return train_df, test_df
+
+
+class EarlyStoppingRandomForest(RandomForestRegressor):
+    def __init__(self, patience=10, min_improvement=1e-4, validation_fraction=0.2, n_estimators=100, random_state=None,
+                 max_depth=None, min_samples_split=2, min_samples_leaf=1, max_features=None, **kwargs):
+        """
+        Initialize the EarlyStoppingRandomForest model.
+
+        Extends RandomForestRegressor with early stopping based on validation set performance.
+        Stops adding trees when the mean squared error (MSE) does not improve by min_improvement
+        for patience iterations.
+
+        Parameters:
+        -----------
+        patience : int, default=10
+            Number of iterations without sufficient MSE improvement before stopping.
+        min_improvement : float, default=1e-4
+            Minimum MSE improvement required to continue training.
+        validation_fraction : float, default=0.2
+            Fraction of training data used as validation set (0 < validation_fraction < 1).
+        n_estimators : int, default=100
+            Maximum number of trees (optimized by early stopping).
+        random_state : int, RandomState instance or None, default=None
+            Controls randomness of the estimator.
+        max_depth : int or None, default=None
+            Maximum depth of each tree.
+        min_samples_split : int or float, default=2
+            Minimum number of samples required to split an internal node.
+        min_samples_leaf : int or float, default=1
+            Minimum number of samples required at a leaf node.
+        max_features : int, float, str or None, default=None
+            Number of features to consider when looking for the best split.
+        **kwargs :
+            Additional parameters passed to RandomForestRegressor.
+        """
+        super().__init__(
+            n_estimators=n_estimators,
+            random_state=random_state,
+            max_depth=max_depth,
+            min_samples_split=min_samples_split,
+            min_samples_leaf=min_samples_leaf,
+            max_features=max_features,
+            **kwargs
+        )
+        self.patience = patience
+        self.min_improvement = min_improvement
+        self.validation_fraction = validation_fraction
+        self.best_score = np.inf
+        self.best_n_estimators = 0
+        self.scores = []
+        logging.info(
+            "Initialized EarlyStoppingRandomForest with patience=%s, min_improvement=%s, validation_fraction=%s",
+            patience, min_improvement, validation_fraction)
+
+    def fit(self, X, y):
+        """
+        Fit the Random Forest model with early stopping.
+
+        Trains the model incrementally, adding one tree at a time, and evaluates performance
+        on a validation set. Stops when validation MSE does not improve sufficiently.
+        Retrains on the full dataset with the optimal number of trees.
+
+        """
+        logging.info("Starting fit with n_estimators=%s", self.n_estimators)
+        # Convert to NumPy arrays if necessary
+        if hasattr(X, 'values'):
+            X = X.values
+        if hasattr(y, 'values'):
+            y = y.values
+        # Split into training and validation sets
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=self.validation_fraction, shuffle=False, random_state=self.random_state
+        )
+        max_estimators = self.n_estimators
+        self.n_estimators = 1
+        super().fit(X_train, y_train)
+        y_pred_val = self.predict(X_val)
+        self.best_score = mean_squared_error(y_val, y_pred_val)
+        self.best_n_estimators = 1
+        self.scores.append(self.best_score)
+        no_improvement_count = 0
+        for n in range(2, max_estimators + 1):
+            self.n_estimators = n
+            super().fit(X_train, y_train)
+            y_pred_val = self.predict(X_val)
+            current_score = mean_squared_error(y_val, y_pred_val)
+            self.scores.append(current_score)
+            if self.best_score - current_score > self.min_improvement:
+                self.best_score = current_score
+                self.best_n_estimators = n
+                no_improvement_count = 0
+            else:
+                no_improvement_count += 1
+            if no_improvement_count >= self.patience:
+                logging.info("Early stopping triggered at %s trees", self.best_n_estimators)
+                break
+        self.n_estimators = self.best_n_estimators if self.best_n_estimators > 0 else 1
+        super().fit(X, y)
+        logging.info("Completed fit with final n_estimators=%s", self.n_estimators)
+        return self
+
+    def predict(self, X):
+        """
+        Predict using the fitted Random Forest model.
+
+        """
+        if hasattr(X, 'values'):
+            X = X.values
+        return super().predict(X)
+
+    def set_params(self, **params):
+        """
+        Set the parameters of the estimator.
+
+        """
+        logging.info("Setting parameters: %s", params)
+        # Update custom parameters
+        for param, value in params.items():
+            if param in ['patience', 'min_improvement', 'validation_fraction']:
+                setattr(self, param, value)
+        # Pass all parameters to the base class
+        super().set_params(**params)
+        return self
+
+    def get_params(self, deep=True):
+        """
+        Get parameters for this estimator.
+
+        Returns all parameters, including those inherited from RandomForestRegressor and
+        custom parameters (patience, min_improvement, validation_fraction).
+
+        """
+        # Get base class parameters
+        params = super().get_params(deep=deep)
+        # Add custom parameters
+        params.update({
+            'patience': self.patience,
+            'min_improvement': self.min_improvement,
+            'validation_fraction': self.validation_fraction
+        })
+        return params
+
+
+class ModelTuner:
+    """
+    Class to tune models such as RandomForest and XGBoost using different techniques.
+    """
+
+    def __init__(self):
+        """
+        Initializes parameter grids for RandomForest and XGBoost models.
+        """
+        self.rf_param_distributions = {
+            'validation_fraction': [0.1, 0.2, 0.3],
+            'max_depth': [10, 20, 30, None],
+            'min_samples_split': [2, 5, 10],
+            'min_samples_leaf': [1, 2, 4],
+            'max_features': ['sqrt', 0.5, None]
+        }
+        self.xgb_param_space = {
+            'learning_rate': Real(0.01, 0.2, prior='log-uniform'),
+            'max_depth': Integer(3, 9),
+            'n_estimators': Integer(100, 1000),
+            'subsample': Real(0.6, 1.0),
+            'colsample_bytree': Real(0.6, 1.0),
+            'gamma': Real(0, 0.5),
+            'reg_lambda': Real(0, 10),
+            'reg_alpha': Real(0, 1)
+        }
+
+    def tune_random_forest(self, X_train, y_train):
+        """
+        Tune the Random Forest model using RandomizedSearchCV with early stopping.
+
+        Searches for the best combination of hyperparameters, leveraging early stopping to optimize
+        the number of trees dynamically. Uses TimeSeriesSplit to respect temporal order in data.
+        """
+        rf = EarlyStoppingRandomForest(
+            random_state=42,
+            patience=10,
+            min_improvement=1e-4,
+            n_estimators=1000,
+            max_depth=None,
+            min_samples_split=2,
+            min_samples_leaf=1,
+            max_features=None
+        )
+        # Debugging: Print available parameters
+        logging.info("Available parameters for EarlyStoppingRandomForest: %s", rf.get_params().keys())
+        tscv = TimeSeriesSplit(n_splits=5)
+        random_search = RandomizedSearchCV(
+            estimator=rf,
+            param_distributions=self.rf_param_distributions,
+            n_iter=30,
+            scoring='neg_mean_squared_error',
+            cv=tscv,
+            n_jobs=-1,
+            verbose=1,
+            random_state=42
+        )
+        try:
+            logging.info("Starting Random Forest tuning...")
+            random_search.fit(X_train, y_train)
+            logging.info("Best parameters for Random Forest: %s", random_search.best_params_)
+            logging.info("Best score: %.6f MSE", -random_search.best_score_)
+            return random_search.best_estimator_, random_search.best_params_
+        except Exception as e:
+            logging.error("Error during Random Forest tuning: %s", e)
+            raise
+
+    def tune_xgboost(self, X_train, y_train, X_val=None, y_val=None, early_stopping_rounds=50):
+        """
+        Tunes the XGBoost model using Bayesian optimization with early stopping.
+        """
+        # Create the XGBoost model specifying eval_metric in the constructor
+        xgb_model = xgb.XGBRegressor(
+            random_state=42,
+            objective='reg:squarederror',
+            eval_metric='rmse'
+        )
+
+        # Configure the Bayesian search
+        bayes_search = BayesSearchCV(
+            estimator=xgb_model,
+            search_spaces=self.xgb_param_space,
+            n_iter=50,
+            scoring='neg_mean_squared_error',
+            cv=TimeSeriesSplit(n_splits=3),
+            n_jobs=-1,
+            verbose=1,
+            random_state=42
+        )
+
+        try:
+            logging.info("Starting XGBoost tuning...")
+            bayes_search.fit(X_train, y_train)
+
+            # Extract the best parameters and score
+            best_params = bayes_search.best_params_
+            best_score = -bayes_search.best_score_
+            logging.info(f"Best parameters for XGBoost: {best_params}")
+            logging.info(f"Best validation MSE: {best_score:.6f}")
+
+            # Create the final XGBoost model with the best parameters
+            final_xgb_model = xgb.XGBRegressor(
+                **best_params,
+                random_state=42,
+                objective='reg:squarederror',
+                eval_metric='rmse'
+            )
+
+            # Prepare the validation set for early stopping
+            evals = [(X_val, y_val)] if X_val is not None and y_val is not None else None
+
+            # Train the final model with early stopping
+            if evals:
+                final_xgb_model.fit(
+                    X_train, y_train,
+                    eval_set=evals,
+                    early_stopping_rounds=early_stopping_rounds,
+                    verbose=10
+                )
+            else:
+                # Train without early stopping if no validation set is provided
+                final_xgb_model.fit(X_train, y_train)
+
+            logging.info("XGBoost model trained successfully.")
+            return final_xgb_model, best_params
+
+        except Exception as e:
+            logging.error(f"Error during XGBoost tuning: {e}")
+            raise
+
+
+class MarketRegimeAnalyzer:
+    """
+    Analyzes market regimes using a Gaussian Hidden Markov Model.
+    Tunes the number of regimes with BIC and computes transition matrices.
+    """
+
+    def __init__(self, n_components=3, random_state=42):
+        self.n_components = n_components
+        self.random_state = random_state
+        self.model = GaussianHMM(n_components=n_components, covariance_type="full",
+                                 n_iter=1000, random_state=random_state)
+        self.scaler = StandardScaler()
+        self.features = ['Credit_Spread']
+
+    def fit(self, data):
+        """
+        Fits the HMM model to the specified features in the data.
+        """
+        available_features = [f for f in self.features if f in data.columns]
+        if not available_features:
+            logging.error("No feature available for market regime analysis.")
+            raise ValueError("No valid feature for HMM fitting.")
+        X = data[available_features].dropna()
+        if X.empty:
+            logging.error("No data available for regime analysis after dropping NaNs.")
+            raise ValueError("No valid data for HMM fitting.")
+        X_scaled = self.scaler.fit_transform(X)
+        self.model.fit(X_scaled)
+        self.used_features = available_features
+        logging.info("HMM model fitted successfully.")
+        return self
+
+    def predict(self, data):
+        """
+        Predicts market regimes using the fitted HMM model on the provided data.
+        """
+        X = data[self.used_features]
+        regimes = pd.Series(index=data.index, data=-1, dtype=int)
+        valid_X = X.dropna()
+        if not valid_X.empty:
+            X_scaled = self.scaler.transform(valid_X)
+            predicted = self.model.predict(X_scaled)
+            regimes.loc[valid_X.index] = predicted
+            logging.info(f"Predicted regimes: Last date {valid_X.index[-1]}, valid rows {len(valid_X)}")
+        return regimes
+
+    def analyze_regimes(self, data, regimes):
+        """
+        Computes mean, standard deviation, and count of Credit_Spread for each regime.
+        """
+        results = []
+        for regime in np.unique(regimes):
+            if regime == -1:
+                continue
+            regime_data = data['Credit_Spread'][regimes == regime]
+            results.append({
+                'regime': regime,
+                'mean': regime_data.mean(),
+                'std': regime_data.std(),
+                'count': len(regime_data)
+            })
+        return pd.DataFrame(results)
+
+    def compute_transition_matrix(self, regimes):
+        """
+        Calculates the transition matrix based on regime predictions.
+        """
+        regimes_array = regimes.values
+        n = self.n_components
+        matrix = np.zeros((n, n))
+        for i in range(len(regimes_array) - 1):
+            if regimes_array[i] != -1 and regimes_array[i + 1] != -1:
+                matrix[regimes_array[i], regimes_array[i + 1]] += 1
+        row_sums = matrix.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1
+        transition_matrix = matrix / row_sums
+        return transition_matrix
+
+    def tune_n_components(self, data, components_range=range(2, 7)):
+        """
+        Determines the optimal number of regimes using BIC and prints the transition matrix for the best model.
+        """
+        available_features = [f for f in self.features if f in data.columns]
+        if not available_features:
+            raise ValueError("No valid feature for HMM tuning.")
+        X = data[available_features].dropna()
+        X_scaled = self.scaler.fit_transform(X)
+        best_bic = np.inf
+        best_n = None
+        best_model = None
+        for n in components_range:
+            model = GaussianHMM(n_components=n, covariance_type="full", n_iter=1000, random_state=self.random_state)
+            model.fit(X_scaled)
+            logL = model.score(X_scaled)
+            p = n ** 2 + 2 * n - 1
+            bic = -2 * logL + p * np.log(X_scaled.shape[0])
+            logging.info(f"n_components={n}, logL={logL:.2f}, BIC={bic:.2f}")
+            if bic < best_bic:
+                best_bic = bic
+                best_n = n
+                best_model = model
+        logging.info(f"Optimal number of regimes: {best_n} with BIC={best_bic:.2f}")
+        self.n_components = best_n
+        self.model = best_model
+        self.used_features = available_features
+        tuned_regimes = self.predict(data)
+        trans_matrix = self.compute_transition_matrix(tuned_regimes)
+        logging.info("Transition matrix for the tuned model:")
+        logging.info("\n" + str(trans_matrix))
+        return best_n, best_bic
+
+    def bic_diagnostics(self, data, components=range(2, 7),
+                        outdir="outputs", save_csv=True, save_fig=True):
+        """
+        Compute and visualize BIC and log-likelihood for different numbers of HMM states.
+        Returns a DataFrame with columns: ['N', 'logL', 'BIC'] (index = N).
+        """
+        import os
+        import pandas as pd
+        import matplotlib.pyplot as plt
+
+        os.makedirs(outdir, exist_ok=True)
+
+        # --- prepare data as in the other methods ---
+        available_features = [f for f in self.features if f in data.columns]
+        if not available_features:
+            raise ValueError("No valid feature for HMM diagnostics.")
+        X = data[available_features].dropna()
+        X_scaled = self.scaler.fit_transform(X)
+
+        rows = []
+        for n in components:
+            m = GaussianHMM(n_components=n, covariance_type="full",
+                            n_iter=1000, random_state=self.random_state)
+            m.fit(X_scaled)
+            logL = m.score(X_scaled)
+            # number of parameters for a 1D Gaussian HMM with per-state full covariance:
+            # transitions: n*(n-1), initials: (n-1), means: n, variances: n  =>  n^2 + 2n - 1
+            p = n ** 2 + 2 * n - 1
+            bic = -2 * logL + p * np.log(X_scaled.shape[0])
+            rows.append({"N": n, "logL": logL, "BIC": bic})
+
+        df = pd.DataFrame(rows).set_index("N").sort_index()
+
+        # --- compact table printout ---
+        print("\nHMM model selection (2 <= N <= 6):")
+        print(df.round(3))
+
+        if save_csv:
+            df.to_csv(f"{outdir}/hmm_bic_curve.csv", float_format="%.3f")
+
+        # --- chart: BIC (left axis) and logL (right axis) ---
+        fig, ax1 = plt.subplots(figsize=(7.5, 4))
+        ax1.plot(df.index, df["BIC"], "-o", label="BIC (↓ better)")
+        ax1.set_xlabel("Number of States (N)")
+        ax1.set_ylabel("BIC", color="C0")
+        ax1.tick_params(axis='y', labelcolor="C0")
+        ax1.grid(True, alpha=0.25)
+
+        ax2 = ax1.twinx()
+        ax2.plot(df.index, df["logL"], "--s", label="Log-likelihood (↑ better)", color="C1")
+        ax2.set_ylabel("Log-likelihood", color="C1")
+        ax2.tick_params(axis='y', labelcolor="C1")
+
+        # highlight N* with minimum BIC
+        n_star = int(df["BIC"].idxmin())
+        ax1.axvline(n_star, color="gray", ls=":", alpha=0.7)
+        ax1.annotate(f"N* = {n_star}", xy=(n_star, df.loc[n_star, "BIC"]),
+                     xytext=(5, 10), textcoords="offset points",
+                     fontsize=9, bbox=dict(boxstyle="round,pad=0.2", fc="w", ec="gray"))
+
+        # combined legend
+        h1, l1 = ax1.get_legend_handles_labels()
+        h2, l2 = ax2.get_legend_handles_labels()
+        ax1.legend(h1 + h2, l1 + l2, loc="best")
+
+        plt.tight_layout()
+        if save_fig:
+            fig.savefig(f"{outdir}/hmm_bic_curve.png", dpi=200)
+        plt.show()
+
+        return df
+
+
+class Visualizer:
+    """
+    Provides methods for visualizing market regimes.
+    """
+
+    @staticmethod
+    def plot_regimes(data, regimes):
+        """
+        Plots Credit Spread data with different colors for each regime over time.
+        """
+        plt.figure(figsize=(10, 6))
+        for regime in np.unique(regimes):
+            if regime == -1:
+                continue
+            mask = regimes == regime
+            plt.scatter(data.index[mask], data['Credit_Spread'][mask], s=6, label=f'Regime {regime}')
+        plt.title('Credit Spread Regimes Over Time')
+        plt.xlabel('Date')
+        plt.ylabel('Credit Spread')
+        plt.legend()
+        plt.grid(True)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.show()
+        logging.info("Regime plot displayed.")
+
+
+class ModelEvaluator:
+    @staticmethod
+    def evaluate_models(models, X_train, y_train, X_test, y_test):
+        import pandas as pd
+
+        # Synchronize indices and drop rows with NaNs
+        train_data = pd.concat([X_train, y_train], axis=1).dropna()
+        X_train = train_data.drop(columns=y_train.name); y_train = train_data[y_train.name]
+        test_data = pd.concat([X_test, y_test], axis=1).dropna()
+        X_test = test_data.drop(columns=y_test.name);   y_test = test_data[y_test.name]
+
+        logging.info(f"Test set: {len(y_test)} rows, last date {y_test.index[-1]}")
+        results = []
+
+        for name, model in models.items():
+            model.fit(X_train, y_train)
+
+            if getattr(model, 'is_tcn', False):
+                # TCN-specific handling (needs warm-up context and horizon alignment)
+                w = getattr(model, 'window', 1)
+                h = getattr(model, 'horizon', 1)
+
+                # --- warm-up context for the TCN ---
+                prepend = X_train.tail(w-1) if w > 1 else X_train.iloc[0:0]
+                X_pred_df = pd.concat([prepend, X_test], axis=0)
+
+                # predictions on the extended window
+                y_pred_full = model.predict(X_pred_df)  # len ≈ len(test) - h
+
+                # evaluation target: y_test shifted by the horizon h
+                y_eval = y_test.iloc[h:h+len(y_pred_full)]
+                y_pred = y_pred_full
+
+                # --- level reconstruction if residual_mode='diff' ---
+                if getattr(model, 'residual_mode', 'level') == 'diff':
+                    # for each prediction at time t, "prev" is:
+                    # - for the first prediction: the last train level
+                    # - thereafter: successive test levels (shift 0, 1, 2, …)
+                    prev_list = []
+                    if len(y_pred) > 0:
+                        prev_list.append(y_train.iloc[-1])  # prev for the first point
+                        prev_list.extend(y_test.iloc[:max(0, len(y_pred)-1)].values)
+                    prev_levels = pd.Series(prev_list, index=y_eval.index[:len(prev_list)])
+
+                    # reconstruction: level_pred = prev + delta_pred
+                    # (safely truncate to the common length)
+                    n = min(len(y_eval), len(y_pred), len(prev_levels))
+                    y_eval = y_eval.iloc[:n]
+                    y_pred = prev_levels.iloc[:n].values + y_pred[:n]
+                else:
+                    # standard alignment
+                    n = min(len(y_eval), len(y_pred))
+                    y_eval = y_eval.iloc[:n]; y_pred = y_pred[:n]
+
+            else:
+                # non-TCN models
+                y_pred = model.predict(X_test)
+                y_eval = y_test
+                n = min(len(y_eval), len(y_pred))
+                y_eval = y_eval.iloc[:n]; y_pred = y_pred[:n]
+
+            rmse = float(np.sqrt(mean_squared_error(y_eval, y_pred)))
+            mae  = float(mean_absolute_error(y_eval, y_pred))
+            r2   = float(r2_score(y_eval, y_pred))
+
+            results.append({
+                'name': name,
+                'rmse': rmse,
+                'mae': mae,
+                'r2': r2,
+                'predictions': y_pred,
+                'test_index': y_eval.index,
+                'y_test': y_eval
+            })
+        return results
+
+
+
+
+class RiskAnalyzer:
+    """
+    Regime-conditioned risk layer for credit spreads.
+
+    - By default it works in **basis points** on ΔCS (upper tail).
+    - Robust bp conversion with `bps_mode`:
+        * 'auto'     -> if the median level > 1 it assumes levels are in percent -> ×100;
+                        otherwise it assumes fraction (0.015 = 1.5%) -> ×1e4
+        * 'percent'  -> force ×100 (percentage points -> bp)
+        * 'fraction' -> force ×1e4 (fraction -> bp)
+    - Quantiles use the "linear" method (no step artifacts at 300/400/600).
+    - Plots show **the level converted to bp**, so the scale is consistent with VaR.
+    """
+
+    def __init__(self,
+                 conf_levels=(0.90, 0.95, 0.99),
+                 horizon=1,
+                 use_bps=True,
+                 min_samples=80,
+                 outdir=None,
+                 save_csv=False,
+                 save_plots=False,
+                 bps_mode='auto'):
+        self.conf_levels = tuple(conf_levels)
+        self.h = int(horizon)
+        self.use_bps = bool(use_bps)
+        self.min_samples = int(min_samples)
+        self.outdir = outdir          # None => do not create folders
+        self.save_csv = bool(save_csv)
+        self.save_plots = bool(save_plots)
+        self.bps_mode = bps_mode      # 'auto' | 'percent' | 'fraction'
+
+    # ---------- helpers ----------
+    def _ensure_outdir(self):
+        if self.outdir:
+            import os
+            os.makedirs(self.outdir, exist_ok=True)
+
+    def _bps_factor(self, cs: pd.Series) -> float:
+        """Decide the conversion factor to basis points (bp)."""
+        if not self.use_bps:
+            return 1.0
+        if self.bps_mode == 'percent':
+            return 100.0
+        if self.bps_mode == 'fraction':
+            return 1e4
+        # auto
+        med = cs.dropna().abs().median()
+        return 100.0 if med > 1 else 1e4
+
+    def _q_linear(self, arr: np.ndarray, alpha: float) -> float:
+        """'Linear' quantile compatible with both old/new NumPy versions."""
+        try:
+            return float(np.quantile(arr, alpha, method="linear"))
+        except TypeError:
+            # numpy < 1.22
+            return float(np.quantile(arr, alpha, interpolation="linear"))
+
+    def _delta(self, cs: pd.Series) -> pd.Series:
+        """Δ level * bp factor (if enabled)."""
+        d = cs.diff(self.h)
+        if self.use_bps:
+            d = d * self._bps_factor(cs)
+        return d
+
+    # ---------- core ----------
+    def var_es_by_regime(self, cs: pd.Series, regimes: pd.Series) -> pd.DataFrame:
+        """
+        Return a table with mean/std/VaR/ES by regime on ΔCS (bp).
+        ES = average of the tail beyond the VaR (upper tail).
+        """
+        d = self._delta(cs).dropna()
+        R = regimes.reindex(d.index)
+
+        out = {}
+        # take only valid regimes (exclude -1)
+        valid_regimes = sorted(set(R.dropna().astype(int).unique()) - {-1})
+        for r in valid_regimes:
+            z = d[R == r].dropna().values
+            if z.size < self.min_samples:
+                continue
+            stats_row = {
+                "N": int(z.size),
+                "mean": float(np.mean(z)),
+                "std": float(np.std(z, ddof=1))
+            }
+            for alpha in self.conf_levels:
+                q = self._q_linear(z, alpha)
+                tail = z[z >= q]
+                es = float(tail.mean()) if tail.size > 0 else float(q)
+                k = int(alpha * 100)
+                stats_row[f"VaR_{k}"] = q
+                stats_row[f"ES_{k}"] = es
+            out[f"Regime_{r}"] = stats_row
+
+        df = pd.DataFrame(out)
+        if self.save_csv:
+            self._ensure_outdir()
+            unit = "bp" if self.use_bps else "level"
+            df.to_csv(f"{self.outdir}/regime_var_es_{unit}_h{self.h}.csv",
+                      float_format="%.6f")
+        return df
+
+    def rolling_var(self, cs: pd.Series, level: float = 0.95, window: int = 252) -> pd.Series:
+        """Rolling VaR (upper tail) of ΔCS in bp using the 'linear' method."""
+        d = self._delta(cs)
+        return d.rolling(window).quantile(level, interpolation="linear")
+
+    # ---------- plotting (first version) ----------
+    def plot_regime_bars(self, var_es_df: pd.DataFrame, title: str = None, fname: str = None):
+        import matplotlib.pyplot as plt
+        if var_es_df.empty:
+            return
+        # pick the 95% VaR row if present, otherwise the first row starting with "VaR"
+        pick = [idx for idx in var_es_df.index if str(idx).startswith("VaR_95")]
+        if not pick:
+            pick = [idx for idx in var_es_df.index if str(idx).startswith("VaR")]
+        row = var_es_df.loc[pick[0]].dropna()
+        ax = row.plot(kind="bar", figsize=(7, 4))
+        ax.set_ylabel("VaR (bp)" if self.use_bps else "VaR")
+        ax.set_title(title or f"Regime-conditioned VaR ({pick[0]})")
+        plt.tight_layout()
+        if self.save_plots:
+            self._ensure_outdir()
+            out = fname or f"{self.outdir}/fig_var_by_regime_{pick[0]}.png"
+            plt.savefig(out, dpi=200)
+        plt.show()
+        return ax
+
+    def plot_rolling_var(self, cs: pd.Series, rolling_var: pd.Series, title: str = None, fname: str = None):
+        """
+        Plot **level in bp** and Rolling VaR (both in bp) on the same scale.
+        """
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(10, 4))
+        lvl_bp = cs * (self._bps_factor(cs) if self.use_bps else 1.0)
+        lvl_bp.plot(ax=ax, label="Credit Spread (level, bp)")
+        rolling_var.reindex(lvl_bp.index).plot(ax=ax, label="Rolling VaR (Δ, upper-tail)")
+        ax.legend(loc="best")
+        ax.set_ylabel("bp" if self.use_bps else "level")
+        ax.set_title(title or "Credit Spread & Rolling VaR")
+        plt.tight_layout()
+        if self.save_plots:
+            self._ensure_outdir()
+            out = fname or f"{self.outdir}/fig_rolling_var.png"
+            plt.savefig(out, dpi=200)
+        plt.show()
+        return ax
+
+    # ---------- forward VaR from residuals ----------
+    def forward_var_from_residuals(self, y_true: pd.Series, y_pred: np.ndarray,
+                                   regimes: pd.Series, alpha: float = 0.95) -> float:
+        """
+        Estimate a VaR on the next error conditioned on the last observed regime.
+        """
+        idx = y_true.index[:len(y_pred)]
+        e = (y_true.loc[idx] - y_pred).dropna()
+        r = regimes.reindex(e.index).astype("Int64")
+        if r.isna().all() or r.dropna().iloc[-1] == -1:
+            return np.nan
+        r_last = int(r.dropna().iloc[-1])
+        eps = e[r == r_last].values
+        if eps.size < self.min_samples:
+            return np.nan
+        return self._q_linear(eps, alpha)
+
+    # ---------- plotting (second version overrides the first in Python) ----------
+    def plot_rolling_var(self, cs: pd.Series, rolling_var: pd.Series,
+                         title: str = None, fname: str = None, mode: str = 'scaled_std'):
+        """
+        Modes:
+          - 'dual'        : separate axes (left = level, right = Δ VaR)
+          - 'scaled_std'  : overlay VaR multiplied by (std(level)/std(VaR)),
+                            with a right secondary axis showing REAL VaR values
+          - 'zscore'      : both in z-score
+          - 'index100'    : both rebased to 100
+        """
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        rv = rolling_var.reindex(cs.index)
+
+        # align and drop leading NaNs for cleaner plotting
+        aligned = pd.concat([cs.rename("cs"), rv.rename("rv")], axis=1).dropna()
+        if aligned.empty:
+            return
+
+        cs_ = aligned["cs"]
+        rv_ = aligned["rv"]
+
+        fig, ax = plt.subplots(figsize=(12, 5))
+
+        if mode == 'dual':
+            l1, = ax.plot(cs_.index, cs_, label="Credit Spread (level, bp)")
+            ax.set_ylabel("bp (level)")
+            ax2 = ax.twinx()
+            l2, = ax2.plot(rv_.index, rv_, label="Rolling VaR (Δ, bp)")
+            ax2.set_ylabel("bp (Δ)")
+            lines = [l1, l2]
+            labels = [ln.get_label() for ln in lines]
+            ax.legend(lines, labels, loc="upper right")
+            ax.grid(True, alpha=0.3)
+
+        elif mode == 'scaled_std':
+            # scale VaR to have similar amplitude to the level
+            scale = float(np.nanstd(cs_.values)) / max(float(np.nanstd(rv_.values)), 1e-9)
+            l1, = ax.plot(cs_.index, cs_, label="Credit Spread (level, bp)")
+            l2, = ax.plot(rv_.index, rv_ * scale,
+                          label=f"Rolling VaR × {scale:.0f} (Δ→level scale)")
+            ax.set_ylabel("bp (level)")
+            # right secondary axis showing REAL VaR values
+            secax = ax.secondary_yaxis('right',
+                                       functions=(lambda y: y / scale, lambda y: y * scale))
+            secax.set_ylabel("Rolling VaR (Δ, bp)")
+            ax.legend(loc="upper left")
+            ax.grid(True, alpha=0.3)
+
+        elif mode == 'zscore':
+            z1 = (cs_ - cs_.mean()) / (cs_.std() + 1e-12)
+            z2 = (rv_ - rv_.mean()) / (rv_.std() + 1e-12)
+            ax.plot(z1.index, z1, label="Credit Spread (z-score)")
+            ax.plot(z2.index, z2, label="Rolling VaR (z-score)")
+            ax.set_ylabel("standardized units")
+            ax.legend(loc="upper right")
+            ax.grid(True, alpha=0.3)
+
+        elif mode == 'index100':
+            base1 = float(cs_.iloc[0])
+            base2 = float(rv_[rv_ > 0].iloc[0]) if (rv_ > 0).any() else max(float(rv_.iloc[0]), 1e-6)
+            ax.plot(cs_.index, cs_ / base1 * 100, label="Credit Spread (index=100)")
+            ax.plot(rv_.index, rv_ / base2 * 100, label="Rolling VaR (index=100)")
+            ax.set_ylabel("Index (base=100)")
+            ax.legend(loc="upper right")
+            ax.grid(True, alpha=0.3)
+
+        else:
+            raise ValueError("mode must be 'dual', 'scaled_std', 'zscore', or 'index100'.")
+
+        ax.set_title(title or "Credit Spread & Rolling VaR (95%)")
+        plt.tight_layout()
+
+        if self.save_plots:
+            self._ensure_outdir()
+            out = fname or f"{self.outdir}/fig_rolling_var_{mode}.png"
+            plt.savefig(out, dpi=200)
+
+        plt.show()
+        return ax
+
+
+def print_results_summary(results):
+    """
+    Displays a formatted summary table of model evaluation results.
+    """
+    print("\n--- Model Results ---")
+    header = f"{'Model':<25}{'RMSE':<15}{'MAE':<15}{'R²':<15}"
+    print(header)
+    print("-" * len(header))
+    for result in results:
+        row = f"{result['name']:<25}{result['rmse']:<15.6f}{result['mae']:<15.6f}{result['r2']:<15.6f}"
+        print(row)
+
+
+def plot_all_model_predictions(all_results):
+    """
+    Generates separate plots for each model's predictions with a year-formatted x-axis.
+    """
+    from matplotlib.dates import YearLocator, DateFormatter
+    for result in all_results:
+        model_name = result['name']
+        y_pred = result['predictions']
+        test_dates = result['test_index']
+        y_test = result['y_test']
+        plt.figure(figsize=(15, 6))
+        if 'Linear Regression' in model_name:
+            y_pred_exp = np.exp(y_pred) - 1
+            y_test_exp = np.exp(y_test) - 1
+            plt.plot(test_dates, y_test_exp, '.r-', label='True')
+            plt.plot(test_dates, y_pred_exp, '.b-', label='Predicted')
+            mse_val = mean_squared_error(y_test_exp, y_pred_exp)
+        else:
+            plt.plot(test_dates, y_test, '.r-', label='True')
+            plt.plot(test_dates, y_pred, '.b-', label='Predicted')
+            mse_val = mean_squared_error(y_test, y_pred)
+        plt.title(f'Credit Spread Prediction with {model_name} (MSE: {mse_val:.6f})', fontsize=12)
+        plt.xlabel('Date', fontsize=10)
+        plt.ylabel('Credit Spread', fontsize=10)
+        plt.legend(loc='upper right')
+        plt.grid(True)
+        plt.gca().xaxis.set_major_locator(YearLocator())
+        plt.gca().xaxis.set_major_formatter(DateFormatter('%Y'))
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.show()
+    logging.info("All model plots have been displayed in separate figures.")
+
+
+##########################################################
+#                      PIPELINE 2                        #
+##########################################################
+
+class LogLinearRegressionWrapper(BaseEstimator, RegressorMixin):
+    """
+    Wraps LinearRegression to automatically apply log1p transformation
+    to the target variable during fit and expm1 during predict.
+    """
+    def __init__(self, fit_intercept=True, copy_X=True, n_jobs=None, positive=False):
+        # Store parameters for LinearRegression
+        self.fit_intercept = fit_intercept
+        self.copy_X = copy_X
+        self.n_jobs = n_jobs
+        self.positive = positive
+        # Internal model instance
+        self._model = LinearRegression(
+            fit_intercept=self.fit_intercept,
+            copy_X=self.copy_X,
+            n_jobs=self.n_jobs,
+            positive=self.positive
+        )
+
+    def fit(self, X, y):
+        """Fits the model applying log1p to y."""
+        try:
+            # Check if y contains non-positive values after potential differencing
+            if (y <= -1).any():
+                 logging.warning("Target variable contains values <= -1. Log1p transformation might produce NaNs or errors. Consider checking data or transformation.")
+                 # Option: Clip values, add a small constant, or handle as needed
+                 y_processed = y.clip(lower=-0.9999) # Example: Clipping
+            else:
+                 y_processed = y
+
+            y_log = np.log1p(y_processed)
+            # Check for NaNs/infs after log1p
+            if np.isnan(y_log).any() or np.isinf(y_log).any():
+                logging.error("NaN or Inf values found in target after log1p transformation.")
+                # Handle this case: maybe impute, drop rows, or raise error
+                # For now, let's try dropping corresponding rows in X and y_log
+                nan_inf_mask = np.isnan(y_log) | np.isinf(y_log)
+                if isinstance(X, pd.DataFrame):
+                    X_clean = X[~nan_inf_mask]
+                else: # Assuming numpy array
+                    X_clean = X[~nan_inf_mask, :]
+                y_log_clean = y_log[~nan_inf_mask]
+                if len(y_log_clean) == 0:
+                    raise ValueError("Target variable resulted in all NaNs/Infs after log1p.")
+                self._model.fit(X_clean, y_log_clean)
+            else:
+                self._model.fit(X, y_log)
+
+            self.is_fitted_ = True
+        except Exception as e:
+            logging.error(f"Error during LogLinearRegressionWrapper fit: {e}")
+            # Consider re-raising or handling appropriately
+            raise
+        return self
+
+
+    def predict(self, X):
+        """Predicts on the original scale applying expm1."""
+        if not hasattr(self, 'is_fitted_') or not self.is_fitted_:
+            raise ValueError("This LogLinearRegressionWrapper instance is not fitted yet.")
+        y_pred_log = self._model.predict(X)
+        # Apply expm1 transformation
+        y_pred = np.expm1(y_pred_log)
+        # Ensure predictions are not negative if log1p was potentially problematic
+        y_pred = np.maximum(y_pred, 0) # Optional: clip negative preds if they don't make sense
+        return y_pred
+
+    # You might need to add get_params and set_params if using grid search directly on this wrapper
+    def get_params(self, deep=True):
+        return self._model.get_params(deep=deep)
+
+    def set_params(self, **params):
+        self._model.set_params(**params)
+        # Also update the wrapper's stored params if they are passed
+        for param, value in params.items():
+             if hasattr(self, param):
+                 setattr(self, param, value)
+        return self
+def c2_feature_engineering(df):
+    """
+    Applies feature engineering for Pipeline 2, adding lags and moving averages to Credit_Spread.
+    """
+    df = df.copy()
+    df['Credit_Spread_lag1'] = df['Credit_Spread'].shift(1)
+    df['Credit_Spread_MA5'] = df['Credit_Spread'].rolling(window=5).mean()
+    df['Credit_Spread_MA20'] = df['Credit_Spread'].rolling(window=20).mean()
+    return df
+
+
+def c2_prepare_target(df, target_column='Credit_Spread', h=FORECAST_H):
+    """
+    Sets the target variable by shifting the specified column forward by h periods.
+    """
+    df = df.copy()
+    df['Target_Credit_Spread'] = df[target_column].shift(-h)
+    return df.dropna(subset=['Target_Credit_Spread'])
+
+
+def c2_filter_data_from_2000(df):
+    """
+    Filters data to include only records from 2000 onward.
+    """
+    df = df.loc[df.index >= '2000-01-01']
+    logging.info(f"Dataset after filtering from 2000: {df.shape}")
+    return df
+
+
+def c2_explore_data(df):
+    """
+    Performs exploratory data analysis, printing summaries and plotting correlations and distributions.
+    """
+    print("First 5 rows:")
+    print(df.head())
+    print("\nDescriptive statistics:")
+    print(df.describe())
+    print("\nDataset info:")
+    print(df.info())
+    print("\nMissing values per column:")
+    print(df.isnull().sum())
+    plt.figure(figsize=(16, 12))
+    sns.heatmap(df.corr(), annot=True, cmap='coolwarm')
+    plt.title("Correlation Heatmap")
+    plt.show()
+    df.hist(bins=30, figsize=(20, 15))
+    plt.suptitle("Feature Distributions", fontsize=20)
+    plt.show()
+
+
+def c2_reduce_skew(df, cols, threshold=0.75):
+    """
+    Reduces skewness in specified columns with a log transformation if skewness exceeds the threshold.
+    """
+    from scipy.stats import skew
+    df_trans = df.copy()
+    for col in cols:
+        s = skew(df_trans[col].dropna())
+        if abs(s) > threshold:
+            df_trans[col] = np.log(df_trans[col] + 1)
+            logging.info(f"Log transformation applied to {col} (initial skew: {s:.2f}).")
+    return df_trans
+
+
+def c2_normalize_df(df, cols):
+    """
+    Normalizes specified columns using StandardScaler.
+    """
+    scaler = StandardScaler()
+    df[cols] = pd.DataFrame(scaler.fit_transform(df[cols]), columns=cols, index=df.index)
+    return df
+
+
+def c2_preprocess_dataset(df):
+    """
+    Preprocesses the dataset by filtering from 2000, filling missing values, reducing skewness, and normalizing.
+    Ensures no NaN or infinite values remain in the dataset.
+    """
+    df = df.loc[df.index >= '2000-01-01']
+    df = df.fillna(method='ffill').dropna()
+    feature_cols = df.columns.difference(['Target_Credit_Spread'])
+    df = c2_reduce_skew(df, feature_cols, threshold=0.75)
+
+    # Remove infinite values that might have been created during logarithmic transformation
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.dropna()
+
+    df = c2_normalize_df(df, feature_cols)
+
+    # Final check to ensure there are no NaN or infinite values
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.dropna()
+
+    print("\nCheck for NaN or infinite values after preprocessing:")
+    has_nan = df.isnull().any().any()
+    has_inf = np.isinf(df.values).any()
+    print(f"Contains NaN: {has_nan}, Contains infinite values: {has_inf}")
+
+    return df
+
+
+def c2_ensure_stationarity(data, cols, alpha=0.05):
+    """
+    Ensures stationarity in specified columns by differencing until ADF test p-value is below alpha.
+    """
+    data_stationary = data.copy()
+    diff_order = {}
+    for col in cols:
+        series = data_stationary[col].dropna()
+        order = 0
+        p_val = adfuller(series)[1]
+        while p_val > alpha and len(series) > 1:
+            series = series.diff().dropna()
+            order += 1
+            p_val = adfuller(series)[1]
+        diff_order[col] = order
+        data_stationary[col] = series.reindex(data_stationary.index, method='ffill')
+        data_stationary[col] = data_stationary[col].fillna(method='bfill')
+        logging.info(f"Column '{col}': differencing order = {order} (final p-value = {p_val:.4f}).")
+    return data_stationary, diff_order
+
+
+def c2_convert_categorical_to_numeric(df):
+    """
+    Converts categorical columns to numeric codes.
+    """
+    for col in df.columns:
+        if pd.api.types.is_categorical_dtype(df[col]):
+            logging.info(f"Converting column '{col}' to numeric.")
+            df[col] = df[col].cat.codes
+    return df
+
+
+def c2_add_market_regime(X, y, n_components=3, random_state=42):
+    """
+    Adds a market regime feature to X using a Gaussian HMM fitted on y.
+    """
+    np.random.seed(random_state)
+    hmm_model = GaussianHMM(n_components=n_components, covariance_type="full",
+                            n_iter=1000, algorithm='map', random_state=random_state)
+    y_reshaped = y.values.reshape(-1, 1)
+    hmm_model.fit(y_reshaped)
+    regimes = hmm_model.predict(y_reshaped)
+    X = X.copy()
+    X['market_regime_cs'] = regimes
+    return X, hmm_model
+
+
+def c2_find_feature_importance(X, y, threshold=0.005):
+    """
+    Computes feature importances with Random Forest, plots them, and selects features above the threshold.
+    """
+    X_numeric = X.select_dtypes(include=[np.number])
+    if X_numeric.empty:
+        raise ValueError("No numeric column available for Random Forest.")
+    rf = RandomForestRegressor(n_estimators=1000, max_depth=5,
+                               min_samples_leaf=4, max_features=0.1, random_state=42)
+    rf.fit(X_numeric, y)
+    features = X_numeric.columns.values
+    importances = rf.feature_importances_
+    sorted_idx = importances.argsort()
+    print("\nFeature Importances:")
+    for idx in sorted_idx:
+        print(f"{features[idx]:<40}: {importances[idx]:.6f}")
+    plt.figure(figsize=(10, 12))
+    plt.barh(features[sorted_idx], importances[sorted_idx], color='skyblue')
+    plt.xlabel('Importance')
+    plt.title('Feature Importance (Random Forest)')
+    plt.tight_layout()
+    plt.show()
+    selected_features = [f for imp, f in zip(importances, features) if imp >= threshold]
+    return selected_features
+
+
+##########################################################
+#                    PIPELINE 1                          #
+##########################################################
+def run_pipeline1(common_df):
+    """
+    Executes Pipeline 1: splits data, performs feature engineering, preprocessing, regime analysis,
+    model training, and risk analysis.
+    """
+    df1 = common_df.copy()
+    train_size = int(len(df1) * 0.8)
+    train_df = df1.iloc[:train_size].copy()
+    test_df = df1.iloc[train_size:].copy()
+    train_df = feature_engineering_causale(train_df, h=FORECAST_H, mode=FORECAST_MODE)
+    test_df = feature_engineering_causale(test_df, h=FORECAST_H, mode=FORECAST_MODE)
+    feature_cols = train_df.columns.difference(['Target', 'Credit_Spread'])
+    train_df = reduce_skew(train_df, feature_cols)
+    test_df = reduce_skew(test_df, feature_cols)
+    train_df, test_df = preprocess_data(train_df, test_df, feature_cols)
+    regime_analyzer = MarketRegimeAnalyzer(random_state=42)
+    best_n, best_bic = regime_analyzer.tune_n_components(train_df)
+
+    bic_df = regime_analyzer.bic_diagnostics(
+        train_df, components=range(2, 7), outdir="outputs",
+        save_csv=True, save_fig=True
+    )
+
+    logging.info(f"Tuned number of regimes: {best_n} with BIC: {best_bic:.2f}")
+    train_df['Regime'] = regime_analyzer.predict(train_df)
+    test_df['Regime'] = regime_analyzer.predict(test_df)
+    trans_matrix = regime_analyzer.compute_transition_matrix(train_df['Regime'])
+    logging.info("Transition matrix (train set):")
+    logging.info("\n" + str(trans_matrix))
+    regime_analysis = regime_analyzer.analyze_regimes(train_df, train_df['Regime'])
+    print("Regime Analysis (Pipeline 1):\n", regime_analysis)
+    Visualizer.plot_regimes(pd.concat([train_df, test_df]), pd.concat([train_df['Regime'], test_df['Regime']]))
+    ra = RiskAnalyzer(
+        conf_levels=(0.90, 0.95, 0.99),
+        horizon=1,
+        use_bps=True,
+        min_samples=80,
+        outdir=None,
+        save_csv=False,
+        save_plots=False,
+        bps_mode='auto'
+    )
+
+    var_es_train = ra.var_es_by_regime(train_df['Credit_Spread'], train_df['Regime'])
+    print("\n[Pipeline1] Regime-conditioned VaR/ES (TRAIN, ΔCS in bp):\n", var_es_train)
+
+    var_es_test = ra.var_es_by_regime(test_df['Credit_Spread'], test_df['Regime'])
+    print("\n[Pipeline1] Regime-conditioned VaR/ES (TEST,  ΔCS in bp):\n", var_es_test)
+
+
+    ra.plot_regime_bars(var_es_train, title="Regime-conditioned VaR (Train, 95%)")
+
+    rolling_v = ra.rolling_var(pd.concat([train_df['Credit_Spread'], test_df['Credit_Spread']]),
+                               level=0.95, window=252)
+    ra.plot_rolling_var(pd.concat([train_df['Credit_Spread'], test_df['Credit_Spread']]),
+                        rolling_v, title="Credit Spread & Rolling VaR (95%)", mode='scaled_std')
+
+
+    X_train = train_df.drop(columns=['Target', 'Credit_Spread'])
+    y_train = train_df['Target']
+    X_test = test_df.drop(columns=['Target', 'Credit_Spread'])
+    y_test = test_df['Target']
+    # --- Baseline naïve: y_{t+1} ≈ y_t (random walk) ---
+
+    # Baseline naïve
+    if FORECAST_MODE == 'level':
+        # y_{t+h} ≈ y_t
+        y_naive = test_df['Credit_Spread'].reindex(y_test.index)
+    else:
+        # Δ_{t→t+h} ≈ 0
+        y_naive = pd.Series(0.0, index=y_test.index)
+
+    mask = y_naive.notna() & y_test.notna()
+    naive_result_p1 = {
+        'name': f"Naive (h={FORECAST_H})",
+        'rmse': float(np.sqrt(mean_squared_error(y_test[mask], y_naive[mask]))),
+        'mae': float(mean_absolute_error(y_test[mask], y_naive[mask])),
+        'r2': float(r2_score(y_test[mask], y_naive[mask])),
+        'predictions': y_naive[mask].values,
+        'test_index': y_test[mask].index,
+        'y_test': y_test[mask]
+    }
+
+    logging.info(f"X_train columns (Pipeline 1): {X_train.columns.tolist()}")
+    model_tuner = ModelTuner()
+    rf_model, rf_params = model_tuner.tune_random_forest(X_train, y_train)
+    xgb_model, xgb_params = model_tuner.tune_xgboost(X_train, y_train)
+    tcn_model = TCNRegressorFastSK(
+        residual_mode='diff' if FORECAST_MODE == 'level' else 'level',
+        window=64, horizon=FORECAST_H,
+        channels=32, n_blocks=5, kernel_size=3, dropout=0.1,
+        n_regimes=best_n, batch_size=128, samples_per_epoch=16000,
+        max_epochs=12, patience=6, lr=2e-3, weight_decay=2e-4, num_workers=0
+    )
+
+
+    models_tab = {
+        'Random Forest': rf_model,
+        'XGBoost': xgb_model,
+    }
+    res_tab = ModelEvaluator.evaluate_models(models_tab, X_train, y_train, X_test, y_test)
+
+
+    models_tcn = {
+        'TCN': tcn_model
+    }
+    res_tcn = ModelEvaluator.evaluate_models(
+        models_tcn,
+        X_train, train_df['Credit_Spread'],
+        X_test, test_df['Credit_Spread']
+    )
+
+    return [naive_result_p1] + res_tab + res_tcn
+
+
+##########################################################
+#                    PIPELINE 2                          #
+##########################################################
+def run_pipeline2(common_df):
+    """
+    Executes Pipeline 2 with CAUSAL preprocessing: split first, then fit-on-train/apply-to-test
+    for all transformations to avoid data leakage.
+    """
+    df2 = common_df.copy()
+
+    # Remove MIDAS columns that could cause problems
+    midas_cols = [col for col in df2.columns if col.endswith('_midas')]
+    print(f"\nMIDAS columns found: {midas_cols}")
+
+    # If there are too many MIDAS columns with missing values, we might want to exclude some
+    if midas_cols:
+        midas_non_nan_pct = df2[midas_cols].count() / len(df2)
+        print("\nPercentage of non-NaN values in MIDAS columns:")
+        print(midas_non_nan_pct)
+
+        # Exclude MIDAS columns with less than 50% of non-NaN values
+        problematic_midas = midas_non_nan_pct[midas_non_nan_pct < 0.5].index.tolist()
+        if problematic_midas:
+            print(f"\nExcluding problematic MIDAS columns: {problematic_midas}")
+            df2 = df2.drop(columns=problematic_midas)
+
+    # Basic data cleaning and feature engineering (before split)
+    daily_cols = ['Credit_Spread', 'TEDRATE', 'y_lag1', 'SPY_DIFF']
+    df_daily = df2[daily_cols].dropna()
+    non_daily_cols = list(set(df2.columns) - set(daily_cols))
+    df_non_daily = df2[non_daily_cols].ffill()
+    df2 = df_daily.join(df_non_daily, how='left').dropna(subset=daily_cols)
+
+    if not isinstance(df2.index, pd.DatetimeIndex):
+        df2.index = pd.to_datetime(df2.index)
+
+    df2 = c2_filter_data_from_2000(df2)
+    c2_explore_data(df2)
+    df2 = c2_feature_engineering(df2)
+    df2 = c2_prepare_target(df2, target_column='Credit_Spread', h=FORECAST_H)
+    df2 = c2_convert_categorical_to_numeric(df2)
+
+    # CRITICAL: Split data BEFORE any preprocessing to avoid leakage
+    train_size = int(len(df2) * 0.8)
+    train_end_date = df2.index[train_size - 1]
+
+    train_df = df2.loc[:train_end_date].copy()
+    test_df = df2.loc[train_end_date + pd.Timedelta(days=1):].copy()
+
+    logging.info(
+        f"Pipeline 2 - Split: Train up to {train_end_date.date()}, Test from {(train_end_date + pd.Timedelta(days=1)).date()}")
+    logging.info(f"Train size: {len(train_df)}, Test size: {len(test_df)}")
+
+    # 1. Fill missing values separately for train and test
+    train_df = train_df.fillna(method='ffill').fillna(method='bfill')
+    test_df = test_df.fillna(method='ffill').fillna(method='bfill')
+
+    # 2. Market Regime FIRST (before FA, scaling, etc.) - use Credit_Spread only
+    train_credit_spread = train_df['Credit_Spread'].dropna()
+    test_credit_spread = test_df['Credit_Spread'].dropna()
+
+    # Fit HMM on train Credit_Spread only (causal)
+    hmm_model = GaussianHMM(n_components=3, random_state=42, covariance_type="full")
+    hmm_model.fit(train_credit_spread.values.reshape(-1, 1))
+
+    # Predict regimes on both train and test
+    train_regimes = hmm_model.predict(train_credit_spread.values.reshape(-1, 1))
+    test_regimes = hmm_model.predict(test_credit_spread.values.reshape(-1, 1))
+
+    # Add regime to both datasets
+    train_df['market_regime_cs'] = -1  # Default value
+    test_df['market_regime_cs'] = -1  # Default value
+    train_df.loc[train_credit_spread.index, 'market_regime_cs'] = train_regimes
+    test_df.loc[test_credit_spread.index, 'market_regime_cs'] = test_regimes
+
+    # 3. Determine which columns need log transformation (ONLY on train)
+    feature_cols = train_df.columns.difference(['Target_Credit_Spread'])
+    log_transform_cols = []
+    for col in feature_cols:
+        if train_df[col].dtype in ['float64', 'int64']:
+            skewness = train_df[col].skew()
+            if abs(skewness) > 0.75:  # Threshold for log transformation
+                log_transform_cols.append(col)
+                logging.info(f"Column {col} will be log-transformed (skew: {skewness:.3f})")
+
+    # 4. Apply log transformation to both train and test using same columns
+    for col in log_transform_cols:
+        train_df[col] = np.log1p(train_df[col])
+        test_df[col] = np.log1p(test_df[col])
+
+    # 5. Fit StandardScaler on train and apply to both
+    scaler = StandardScaler()
+    train_features = train_df[feature_cols]
+    test_features = test_df[feature_cols]
+
+    # Drop NaN rows before scaling to avoid issues
+    train_features_clean = train_features.dropna()
+    test_features_clean = test_features.dropna()
+
+    if len(train_features_clean) < 10:
+        raise ValueError(f"Not enough clean data for scaling. Only {len(train_features_clean)} rows available.")
+
+    train_features_scaled = pd.DataFrame(
+        scaler.fit_transform(train_features_clean),
+        columns=feature_cols,
+        index=train_features_clean.index
+    )
+    test_features_scaled = pd.DataFrame(
+        scaler.transform(test_features_clean),
+        columns=feature_cols,
+        index=test_features_clean.index
+    )
+
+    # Update train_df and test_df to match clean indices
+    train_df = train_df.loc[train_features_clean.index]
+    test_df = test_df.loc[test_features_clean.index]
+
+    # 6. Factor Analysis: fit on train, transform both
+    # Remove columns with correlation issues
+    corr_matrix = train_features_scaled.corr()
+    problematic_cols = []
+    for col in corr_matrix.columns:
+        if corr_matrix[col].isnull().any() or np.isinf(corr_matrix[col].values).any():
+            problematic_cols.append(col)
+
+    if problematic_cols:
+        print(f"Removing problematic columns for FA: {problematic_cols}")
+        train_features_scaled = train_features_scaled.drop(columns=problematic_cols)
+        test_features_scaled = test_features_scaled.drop(columns=problematic_cols)
+        feature_cols = [col for col in feature_cols if col not in problematic_cols]
+
+    if train_features_scaled.shape[1] < 2:
+        raise ValueError("Not enough columns for factor analysis after removing problematic columns.")
+
+    # Fit FA on train only
+    fa = FactorAnalyzer(rotation='varimax')
+    fa.set_params(n_factors=min(train_features_scaled.shape[1], 10))
+    fa.fit(train_features_scaled)
+
+    # Determine number of factors from train eigenvalues
+    ev, _ = fa.get_eigenvalues()
+    n_factors = sum(ev > 1)
+    print(f"Number of factors selected (eigenvalue > 1): {n_factors}")
+
+    # Plot scree plot
+    plt.figure(figsize=(8, 6))
+    plt.plot(range(1, len(ev) + 1), ev, marker='o')
+    plt.xlabel('Factor Number')
+    plt.ylabel('Eigenvalue')
+    plt.title('Scree Plot for Factor Analysis')
+    plt.grid(True)
+    plt.show()
+
+    # Refit FA with optimal number of factors on train
+    fa.set_params(n_factors=n_factors, rotation='varimax')
+    fa.fit(train_features_scaled)
+
+    # Get factor loadings and display table
+    loadings = pd.DataFrame(fa.loadings_, index=train_features_scaled.columns,
+                            columns=[f"Factor{i + 1}" for i in range(n_factors)])
+    print("\nFactor Loadings Table:")
+    print(loadings.round(3))
+
+    # Transform both train and test
+    train_fa_scores = fa.transform(train_features_scaled)
+    test_fa_scores = fa.transform(test_features_scaled)
+
+    # Create factor names
+    if n_factors == 4:
+        factor_names = [
+            "Policy & Uncertainty Factor",
+            "Macro-Economic Conditions Factor",
+            "Credit Spread Factor",
+            "Trade & Security Factor"
+        ]
+    else:
+        factor_names = [f"Factor{i + 1}" for i in range(n_factors)]
+
+    # Add factor scores to both datasets
+    train_fa_df = pd.DataFrame(train_fa_scores, columns=factor_names, index=train_features_scaled.index)
+    test_fa_df = pd.DataFrame(test_fa_scores, columns=factor_names, index=test_features_scaled.index)
+
+    train_df_final = train_df[['Target_Credit_Spread']].join(train_fa_df)
+    test_df_final = test_df[['Target_Credit_Spread']].join(test_fa_df)
+
+    # 7. Stationarity: determine differencing order on train, apply to both
+    features_to_stationarize = factor_names  # Use factor scores for stationarity
+
+    # Determine differencing order on train only
+    train_stationary, diff_info = c2_ensure_stationarity(train_df_final, features_to_stationarize, alpha=0.05)
+    print(f"Differencing orders (determined on train): {diff_info}")
+
+    # Apply same differencing to test
+    test_stationary = test_df_final.copy()
+    for col in features_to_stationarize:
+        if col in diff_info and diff_info[col] > 0:
+            for _ in range(diff_info[col]):
+                test_stationary[col] = test_stationary[col].diff()
+
+    # Drop NaN rows from differencing
+    train_stationary = train_stationary.dropna()
+    test_stationary = test_stationary.dropna()
+
+
+    # 7. Stationarity: determine differencing order on train, apply to both
+    features_to_stationarize = factor_names  # Use factor scores for stationarity
+
+    # Determine differencing order on train only
+    train_stationary, diff_info = c2_ensure_stationarity(train_df_final, features_to_stationarize, alpha=0.05)
+    print(f"Differencing orders (determined on train): {diff_info}")
+
+    # Apply same differencing to test
+    test_stationary = test_df_final.copy()
+    for col in features_to_stationarize:
+        if col in diff_info and diff_info[col] > 0:
+            for _ in range(diff_info[col]):
+                # Make sure to handle potential NaNs introduced during multiple diffs
+                test_stationary[col] = test_stationary[col].diff()
+
+    # Drop NaN rows introduced by differencing
+    train_stationary = train_stationary.dropna()
+    test_stationary = test_stationary.dropna()
+
+
+    # 8. Prepare final data for feature importance and modeling
+    X_train_stat = train_stationary.drop(columns=['Target_Credit_Spread'])
+    y_train_stat = train_stationary['Target_Credit_Spread']  # Target original
+    X_test_stat = test_stationary.drop(columns=['Target_Credit_Spread'])
+    y_test_stat = test_stationary['Target_Credit_Spread']  # Target original
+
+    # Convert potentially remaining categorical columns (like market_regime if added before FA)
+    X_train_stat = c2_convert_categorical_to_numeric(X_train_stat)
+    X_test_stat = c2_convert_categorical_to_numeric(X_test_stat)
+
+    # Log transform target FOR FEATURE IMPORTANCE calculation (as originally done)
+    y_train_stat_log = np.log1p(y_train_stat)
+
+    # Select numeric features suitable for RF importance
+    X_train_stat_numeric = X_train_stat.select_dtypes(include=[np.number])
+
+    # Ensure alignment before importance calculation
+    common_index_train = X_train_stat_numeric.index.intersection(y_train_stat_log.index)
+    X_train_stat_numeric = X_train_stat_numeric.loc[common_index_train]
+    y_train_stat_log = y_train_stat_log.loc[common_index_train]
+
+    if X_train_stat_numeric.empty or y_train_stat_log.empty:
+        raise ValueError(
+            "Pipeline 2: No aligned numeric data available for feature importance calculation after stationarity.")
+
+    # --- CALL FEATURE IMPORTANCE FUNCTION HERE ---
+    logging.info("Pipeline 2: Calculating feature importance on final preprocessed training data...")
+    selected_features = c2_find_feature_importance(X_train_stat_numeric, y_train_stat_log, threshold=0.005)
+    # selected_features now contains the names of important features AFTER stationarity etc.
+
+    # 9. Final selection for modeling
+    # Ensure selected_features only contains columns present in the final dataframes
+    final_feature_cols = [col for col in selected_features if col in X_train_stat_numeric.columns]
+
+    if not final_feature_cols:
+        raise ValueError(
+            "Pipeline 2: No features selected based on importance threshold, or selected features not found.")
+
+    X_train_selected = X_train_stat_numeric[final_feature_cols]
+    # Apply selection to test set (ensure columns exist and are numeric)
+    X_test_stat_numeric = X_test_stat.select_dtypes(include=[np.number])
+    # Ensure test set has the selected columns, handling potential misses if needed
+    missing_cols_test = set(final_feature_cols) - set(X_test_stat_numeric.columns)
+    if missing_cols_test:
+        logging.warning(f"Pipeline 2: Test set missing selected features: {missing_cols_test}. These will be ignored.")
+        final_feature_cols_test = [col for col in final_feature_cols if col in X_test_stat_numeric.columns]
+    else:
+        final_feature_cols_test = final_feature_cols
+
+    if not final_feature_cols_test:
+        raise ValueError("Pipeline 2: No selected features available in the test set.")
+
+    X_test_selected = X_test_stat_numeric[final_feature_cols_test]
+
+    # Align y_test with the final X_test_selected index
+    y_test_aligned = y_test_stat.reindex(X_test_selected.index).dropna()
+    X_test_selected = X_test_selected.reindex(y_test_aligned.index)  # Realign X after y dropna
+
+    # Align y_train similarly
+    y_train_aligned = y_train_stat.reindex(X_train_selected.index).dropna()
+    X_train_selected = X_train_selected.reindex(y_train_aligned.index)
+
+    logging.info(f"Pipeline 2: Final features for LR: {X_train_selected.columns.tolist()}")
+
+    # Train the wrapped model
+    lr_wrapper_model = LogLinearRegressionWrapper()
+    try:
+        lr_wrapper_model.fit(X_train_selected, y_train_aligned)
+        logging.info("Pipeline 2: LogLinearRegressionWrapper fitted successfully.")
+    except ValueError as e:
+        logging.error(f"Pipeline 2: Error fitting LogLinearRegressionWrapper: {e}")
+        return {'model': None, 'error': str(e),
+                'X_train': X_train_selected, 'y_train': y_train_aligned,
+                'X_test': X_test_selected,
+                'y_test': y_test_aligned}  # Pass data even on failure for potential debugging
+
+    # Return model and data for evaluation by ModelEvaluator
+    return {
+        'model': lr_wrapper_model,
+        'X_train': X_train_selected,
+        'y_train': y_train_aligned,
+        'X_test': X_test_selected,
+        'y_test': y_test_aligned
+    }
+
+
+##########################################################
+#                        MAIN                            #
+##########################################################
+def main():
+    """
+    Main function to load data, execute both pipelines, summarize results,
+    and plot predictions using standardized evaluation.
+    """
+    config = CommonConfig()
+    midas_loader = MIDASDataLoader(config)
+    transformed_df = midas_loader.load_and_transform_data()
+    logging.info(
+        f"Combined dataset with MIDAS transformation: {transformed_df.shape}, Columns: {transformed_df.columns.tolist()}")
+    midas_cols = [col for col in transformed_df.columns if col.endswith('_midas')]
+    logging.info(f"MIDAS transformed columns: {midas_cols}")
+
+    # --- Execute Pipeline 1 and Evaluate ---
+    # run_pipeline1 now returns the list including the naive baseline + evaluated RF, XGB, TCN
+    results_pipeline1 = run_pipeline1(transformed_df)
+    # Extract evaluated models (excluding naive for now, will add later)
+    evaluated_results_p1 = [res for res in results_pipeline1 if not res['name'].startswith('Naive')]
+    naive_baseline_result = results_pipeline1[0] # Assuming naive is first
+
+    # --- Execute Pipeline 2 to get model and data ---
+    results_pipeline2_data = run_pipeline2(transformed_df)
+
+    # Check if pipeline 2 succeeded
+    if results_pipeline2_data.get('model') is None:
+         logging.error("Pipeline 2 failed to produce a model. Skipping its evaluation.")
+         evaluated_results_p2 = []
+    else:
+        # --- Evaluate Pipeline 2 Model using ModelEvaluator ---
+        models_p2 = {'Linear Regression ': results_pipeline2_data['model']}
+        evaluated_results_p2 = ModelEvaluator.evaluate_models(
+            models=models_p2,
+            X_train=results_pipeline2_data['X_train'],
+            y_train=results_pipeline2_data['y_train'],
+            X_test=results_pipeline2_data['X_test'],
+            y_test=results_pipeline2_data['y_test']
+        )
+        # Rename the model in the results for clarity if needed
+        if evaluated_results_p2:
+            evaluated_results_p2[0]['name'] = 'Linear Regression (P2)'
+
+
+    # --- Combine All Results ---
+    # Ensure naive baseline has compatible structure if needed later
+    # Make sure predictions/y_test/index lengths match if comparing directly
+    all_evaluated_results = [naive_baseline_result] + evaluated_results_p1 + evaluated_results_p2
+
+    # --- Summarize and Plot ---
+    print_results_summary(all_evaluated_results)
+    plot_all_model_predictions(all_evaluated_results)
+
+if __name__ == "__main__":
+    main()
