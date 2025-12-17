@@ -1,0 +1,2 @@
+# Credit-Spread-Forecasting-A-Study-of-How-Machine-Learning-Can-Enhance-Predictive-Accuracy
+Credit Spread forecasting via Machine Learning (XGBoost, RF) and Deep Learning (TCN). The project integrates mixed-frequency macro data using MIDAS algorithms and employs Hidden Markov Models (HMM) for regime detection, significantly enhancing predictive accuracy and regime-conditioned risk analysis (VaR/ES).
